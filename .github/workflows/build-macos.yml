@@ -55,9 +55,16 @@ jobs:
         id: xray
         run: |
           set -e
-          # Default to the known-good bundled core. Override with the
-          # xray_version workflow input only when you want a newer core.
-          TAG="${{ github.event.inputs.xray_version || 'v26.3.27' }}"
+          # Default: bundle the LATEST real Xray core automatically.
+          # Pin with the xray_version workflow input to freeze a specific core.
+          if [ -z "${{ github.event.inputs.xray_version }}" ]; then
+            TAG=$(curl -fsSL --retry 5 --retry-delay 5 -o /dev/null -w '%{url_effective}' \
+                  "https://github.com/XTLS/Xray-core/releases/latest" \
+                  | sed -E 's#.*/tag/([^/]+).*#\1#')
+            [ -z "$TAG" ] && TAG="v26.3.27"
+          else
+            TAG="${{ github.event.inputs.xray_version }}"
+          fi
           echo "Xray core tag: $TAG"
           mkdir -p /tmp/xray/{x86,arm}
           curl -fL --retry 5 --retry-delay 5 --retry-all-errors -o /tmp/xray/x86.zip "https://github.com/XTLS/Xray-core/releases/download/${TAG}/Xray-macos-64.zip"
