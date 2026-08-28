@@ -74,9 +74,17 @@ jobs:
           echo "Bundled xray: ${VER}"
 
       - name: Build universal Tauri app (macOS ARM + Intel)
-        run: npm run tauri build -- --target universal-apple-darwin
+        run: npm run tauri build -- --target universal-apple-darwin 2>&1 | tee build.log
         env:
           CI: true
+
+      - name: Upload build log on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lionray-build-log
+          path: build.log
+          if-no-files-found: ignore
 
       - name: Upload dmg / pkg artifacts
         uses: actions/upload-artifact@v4
