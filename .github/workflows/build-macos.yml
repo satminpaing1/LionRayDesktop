@@ -41,9 +41,9 @@ jobs:
         run: |
           APP_VER="${{ github.event.inputs.app_version || '1.6.0' }}"
           echo "APP_VERSION=$APP_VER"
-          sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"$APP_VER\"/" src-tauri/tauri.conf.json
-          sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"$APP_VER\"/" package.json
-          sed -i "s/pub const APP_VERSION: &str = \"[^\"]*\"/pub const APP_VERSION: \&str = \"$APP_VER\";/" src-tauri/src/lib.rs
+          sed -i '' "s/\"version\": \"[^\"]*\"/\"version\": \"$APP_VER\"/" src-tauri/tauri.conf.json
+          sed -i '' "s/\"version\": \"[^\"]*\"/\"version\": \"$APP_VER\"/" package.json
+          sed -i '' "s/pub const APP_VERSION: &str = \"[^\"]*\"/pub const APP_VERSION: \&str = \"$APP_VER\";/" src-tauri/src/lib.rs
           grep -n '"version"' src-tauri/tauri.conf.json package.json
           grep -n 'APP_VERSION: &str' src-tauri/src/lib.rs
 
