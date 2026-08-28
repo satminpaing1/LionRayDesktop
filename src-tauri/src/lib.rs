@@ -729,6 +729,13 @@ fn find_xray_binary() -> Result<std::path::PathBuf, String> {
         if let Some(dir) = exe.parent() {
             candidates.push(dir.join("xray-bundle").join(exe_name));
             candidates.push(dir.join("resources").join("xray-bundle").join(exe_name));
+            candidates.push(dir.join("Resources").join("xray-bundle").join(exe_name));
+            // macOS .app bundle: exe is in Contents/MacOS, resources in
+            // Contents/Resources — go up one level and into Resources.
+            if let Some(parent) = dir.parent() {
+                candidates.push(parent.join("Resources").join("xray-bundle").join(exe_name));
+                candidates.push(parent.join("resources").join("xray-bundle").join(exe_name));
+            }
             candidates.push(dir.join(exe_name));
         }
     }

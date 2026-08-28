@@ -1,4 +1,4 @@
-name: Build macOS (dmg / pkg)
+name: Build macOS (universal dmg / pkg)
 
 on:
   workflow_dispatch:
@@ -9,6 +9,8 @@ on:
 jobs:
   macos:
     runs-on: macos-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -24,6 +26,30 @@ jobs:
       - name: Install frontend deps
         run: npm install
 
+      # XTLS only ships single-arch macOS binaries (macos-64 = x86_64,
+      # macos-arm64-v8a = arm64). To make a TRULY universal .app we merge both
+      # into one fat xray binary with lipo, then bundle that. Without this the
+      # app would only run on one architecture.
+      - name: Build universal Xray core (lipo x86_64 + arm64)
+        id: xray
+        run: |
+          set -e
+          TAG=$(curl -fsSL https://api.github.com/repos/XTLS/Xray-core/releases/latest \
+                | grep -o '"tag_name": *"[^"]*"' | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "Xray core tag: $TAG"
+          mkdir -p /tmp/xray/{x86,arm}
+          curl -fL -o /tmp/xray/x86.zip "https://github.com/XTLS/Xray-core/releases/download/${TAG}/Xray-macos-64.zip"
+          curl -fL -o /tmp/xray/arm.zip "https://github.com/XTLS/Xray-core/releases/download/${TAG}/Xray-macos-arm64-v8a.zip"
+          unzip -o -q /tmp/xray/x86.zip -d /tmp/xray/x86
+          unzip -o -q /tmp/xray/arm.zip -d /tmp/xray/arm
+          lipo -create -output src-tauri/xray-bundle/xray /tmp/xray/x86/xray /tmp/xray/arm/xray
+          lipo -info src-tauri/xray-bundle/xray
+          # strip leading "v" for the displayed version
+          VER="${TAG#v}"
+          echo "${VER}" > src-tauri/xray-bundle/version.txt
+          echo "xray_ver=${VER}" >> "$GITHUB_OUTPUT"
+          echo "Bundled xray: ${VER}"
+
       - name: Build universal Tauri app (macOS ARM + Intel)
         run: npm run tauri build -- --target universal-apple-darwin
         env:
@@ -37,3 +63,19 @@ jobs:
             src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
             src-tauri/target/universal-apple-darwin/release/bundle/pkg/*.pkg
           if-no-files-found: warn
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.6.0
+          name: "LionRay VPN Desktop v1.6.0 (Universal macOS)"
+          body: |
+            Universal macOS build (Apple Silicon + Intel).
+            Xray core: ${{ steps.xray.outputs.xray_ver }}
+
+            > Unsigned build — right-click the app and choose Open to bypass
+            > Gatekeeper, or run: xattr -dr com.apple.quarantine "/Applications/LionRay VPN.app"
+          files: |
+            src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            src-tauri/target/universal-apple-darwin/release/bundle/pkg/*.pkg
+          overwrite: true
