@@ -78,4 +78,4 @@ jobs:
           files: |
             src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
             src-tauri/target/universal-apple-darwin/release/bundle/pkg/*.pkg
-          overwrite: true
+          overwrite_files: true
