@@ -16,14 +16,16 @@ jobs:
         with:
           node-version: 20
 
-      - name: Install Rust toolchain
+      - name: Install Rust toolchain (Apple Silicon + Intel)
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
 
       - name: Install frontend deps
         run: npm install
 
-      - name: Build Tauri app (macOS)
-        run: npm run tauri build
+      - name: Build universal Tauri app (macOS ARM + Intel)
+        run: npm run tauri build -- --target universal-apple-darwin
         env:
           CI: true
 
@@ -32,6 +34,6 @@ jobs:
         with:
           name: lionray-macos
           path: |
-            src-tauri/target/release/bundle/dmg/*.dmg
-            src-tauri/target/release/bundle/pkg/*.pkg
+            src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            src-tauri/target/universal-apple-darwin/release/bundle/pkg/*.pkg
           if-no-files-found: warn
