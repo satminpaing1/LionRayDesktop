@@ -58,13 +58,13 @@ jobs:
           if [ -n "${{ github.event.inputs.xray_version }}" ]; then
             TAG="${{ github.event.inputs.xray_version }}"
           else
-            TAG=$(curl -fsSL https://api.github.com/repos/XTLS/Xray-core/releases/latest \
+            TAG=$(curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors https://api.github.com/repos/XTLS/Xray-core/releases/latest \
                   | grep -o '"tag_name": *"[^"]*"' | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
           fi
           echo "Xray core tag: $TAG"
           mkdir -p /tmp/xray/{x86,arm}
-          curl -fL -o /tmp/xray/x86.zip "https://github.com/XTLS/Xray-core/releases/download/${TAG}/Xray-macos-64.zip"
-          curl -fL -o /tmp/xray/arm.zip "https://github.com/XTLS/Xray-core/releases/download/${TAG}/Xray-macos-arm64-v8a.zip"
+          curl -fL --retry 5 --retry-delay 5 --retry-all-errors -o /tmp/xray/x86.zip "https://github.com/XTLS/Xray-core/releases/download/${TAG}/Xray-macos-64.zip"
+          curl -fL --retry 5 --retry-delay 5 --retry-all-errors -o /tmp/xray/arm.zip "https://github.com/XTLS/Xray-core/releases/download/${TAG}/Xray-macos-arm64-v8a.zip"
           unzip -o -q /tmp/xray/x86.zip -d /tmp/xray/x86
           unzip -o -q /tmp/xray/arm.zip -d /tmp/xray/arm
           lipo -create -output src-tauri/xray-bundle/xray /tmp/xray/x86/xray /tmp/xray/arm/xray
