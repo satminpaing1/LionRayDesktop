@@ -1,0 +1,15 @@
+# Node / frontend
+node_modules/
+dist/
+
+# Tauri / Rust build output
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# Bundled artifacts (local only)
+dist-output/
+
+# Miscellaneous
+*.log
+.DS_Store
+Thumbs.db

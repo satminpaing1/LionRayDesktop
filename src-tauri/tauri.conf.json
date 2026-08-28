@@ -1,0 +1,54 @@
+{
+  "productName": "LionRay VPN",
+  "version": "1.6.0",
+  "identifier": "com.lionray.vpn.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "LionRay VPN",
+        "width": 410,
+        "height": 700,
+        "center": true,
+        "minWidth": 360,
+        "minHeight": 480,
+        "resizable": true,
+        "decorations": true,
+        "transparent": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg", "nsis"],
+    "icon": [
+      "icons/icon.ico",
+      "icons/icon.icns",
+      "icons/128x128.png",
+      "icons/128x128@2x.png"
+    ],
+    "resources": [
+      "xray-bundle/*"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "10.15"
+    },
+    "windows": {
+      "nsis": {
+        "installerHooks": "installer-hooks.nsh"
+      }
+    }
+  }
+}
+
+
+
+
