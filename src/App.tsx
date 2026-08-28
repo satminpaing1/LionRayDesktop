@@ -262,6 +262,7 @@ function App() {
   const [xrayCheckMsg, setXrayCheckMsg] = useState("");
   const [confirmDlg, setConfirmDlg] = useState<{ msg: string; onOk: () => void } | null>(null);
   const [bypassInput, setBypassInput] = useState("");
+  const [appUpdate, setAppUpdate] = useState<string | null>(null);
   const [lastSrv, setLastSrv] = useState<Server | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -281,6 +282,15 @@ function App() {
   useEffect(() => {
     document.documentElement.classList.toggle("dark", settings.dark);
   }, [settings.dark]);
+
+  // notify the user when a newer desktop release (new app version / bundled core) is published
+  useEffect(() => {
+    invoke<string | null>("check_update")
+      .then((t) => {
+        if (t) setAppUpdate(t);
+      })
+      .catch(() => {});
+  }, []);
 
   const showToast = useCallback((msg: string, bad = false) => {
     setToast({ msg, bad });
@@ -866,6 +876,19 @@ function App() {
             <span className="logo">🦁 LionRay</span>
             <RoutingIcon />
           </header>
+
+          {appUpdate && (
+            <div
+              className="update-banner"
+              onClick={() =>
+                invoke("open_link", {
+                  url: "https://github.com/satminpaing1/LionRayDesktop/releases/latest",
+                })
+              }
+            >
+              ⬆ New version {appUpdate} available — tap to download
+            </div>
+          )}
 
           {/* node card */}
           <div className="node-card" onClick={() => setTab("servers")}>

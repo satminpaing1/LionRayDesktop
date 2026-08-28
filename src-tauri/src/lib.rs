@@ -1288,15 +1288,39 @@ fn get_core_version() -> Result<String, String> {
     Ok(ver)
 }
 
+fn parse_ver(s: &str) -> Vec<u32> {
+    s.trim_start_matches('v')
+        .split('.')
+        .map(|p| p.parse::<u32>().unwrap_or(0))
+        .collect()
+}
+
+// numeric semver compare so e.g. 1.7.10 > 1.7.1 (a substring check would miss this)
+fn ver_gt(a: &str, b: &str) -> bool {
+    let va = parse_ver(a);
+    let vb = parse_ver(b);
+    let n = va.len().max(vb.len());
+    for i in 0..n {
+        let x = *va.get(i).unwrap_or(&0);
+        let y = *vb.get(i).unwrap_or(&0);
+        if x != y {
+            return x > y;
+        }
+    }
+    false
+}
+
 #[tauri::command]
 fn check_update() -> Result<Option<String>, String> {
-    let body = http_get("https://api.github.com/repos/satminpaing1/LionRayVPN/releases/latest")?;
+    let body = http_get("https://api.github.com/repos/satminpaing1/LionRayDesktop/releases/latest")?;
     let v: Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
     let tag = v["tag_name"].as_str().unwrap_or("").to_string();
-    if tag.contains(APP_VERSION) {
+    if tag.is_empty() {
         Ok(None)
-    } else {
+    } else if ver_gt(&tag, APP_VERSION) {
         Ok(Some(tag))
+    } else {
+        Ok(None)
     }
 }
 
