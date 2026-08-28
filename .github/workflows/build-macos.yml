@@ -2,6 +2,15 @@ name: Build macOS (universal dmg / pkg)
 
 on:
   workflow_dispatch:
+    inputs:
+      app_version:
+        description: 'App version to build & release (e.g. 1.7.0)'
+        required: true
+        type: string
+      xray_version:
+        description: 'Optional: pin Xray core tag (e.g. v26.3.27). Leave empty = latest'
+        required: false
+        type: string
   push:
     tags:
       - "v*"
@@ -26,16 +35,31 @@ jobs:
       - name: Install frontend deps
         run: npm install
 
+      # Set the app version across all the places that define it, so the dmg
+      # name, the About panel and the in-app update check all agree.
+      - name: Set app version
+        run: |
+          APP_VER="${{ github.event.inputs.app_version || '1.6.0' }}"
+          echo "APP_VERSION=$APP_VER"
+          sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"$APP_VER\"/" src-tauri/tauri.conf.json
+          sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"$APP_VER\"/" package.json
+          sed -i "s/pub const APP_VERSION: &str = \"[^\"]*\"/pub const APP_VERSION: \&str = \"$APP_VER\";/" src-tauri/src/lib.rs
+          grep -n '"version"' src-tauri/tauri.conf.json package.json
+          grep -n 'APP_VERSION: &str' src-tauri/src/lib.rs
+
       # XTLS only ships single-arch macOS binaries (macos-64 = x86_64,
       # macos-arm64-v8a = arm64). To make a TRULY universal .app we merge both
-      # into one fat xray binary with lipo, then bundle that. Without this the
-      # app would only run on one architecture.
+      # into one fat xray binary with lipo, then bundle that.
       - name: Build universal Xray core (lipo x86_64 + arm64)
         id: xray
         run: |
           set -e
-          TAG=$(curl -fsSL https://api.github.com/repos/XTLS/Xray-core/releases/latest \
-                | grep -o '"tag_name": *"[^"]*"' | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ -n "${{ github.event.inputs.xray_version }}" ]; then
+            TAG="${{ github.event.inputs.xray_version }}"
+          else
+            TAG=$(curl -fsSL https://api.github.com/repos/XTLS/Xray-core/releases/latest \
+                  | grep -o '"tag_name": *"[^"]*"' | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          fi
           echo "Xray core tag: $TAG"
           mkdir -p /tmp/xray/{x86,arm}
           curl -fL -o /tmp/xray/x86.zip "https://github.com/XTLS/Xray-core/releases/download/${TAG}/Xray-macos-64.zip"
@@ -44,7 +68,6 @@ jobs:
           unzip -o -q /tmp/xray/arm.zip -d /tmp/xray/arm
           lipo -create -output src-tauri/xray-bundle/xray /tmp/xray/x86/xray /tmp/xray/arm/xray
           lipo -info src-tauri/xray-bundle/xray
-          # strip leading "v" for the displayed version
           VER="${TAG#v}"
           echo "${VER}" > src-tauri/xray-bundle/version.txt
           echo "xray_ver=${VER}" >> "$GITHUB_OUTPUT"
@@ -67,8 +90,8 @@ jobs:
       - name: Create / update GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.6.0
-          name: "LionRay VPN Desktop v1.6.0 (Universal macOS)"
+          tag_name: v${{ github.event.inputs.app_version || '1.6.0' }}
+          name: "LionRay VPN Desktop v${{ github.event.inputs.app_version || '1.6.0' }} (Universal macOS)"
           body: |
             Universal macOS build (Apple Silicon + Intel).
             Xray core: ${{ steps.xray.outputs.xray_ver }}
