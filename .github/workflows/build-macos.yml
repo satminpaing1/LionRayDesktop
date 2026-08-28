@@ -36,14 +36,33 @@ jobs:
         run: npm install
 
       # Set the app version across all the places that define it, so the dmg
-      # name, the About panel and the in-app update check all agree.
+      # name, the About panel and the in-app update check all agree. Done with
+      # Python to avoid shell-quoting pitfalls that sed has with " characters.
       - name: Set app version
         run: |
           APP_VER="${{ github.event.inputs.app_version || '1.6.0' }}"
           echo "APP_VERSION=$APP_VER"
-          sed -i '' "s/\"version\": \"[^\"]*\"/\"version\": \"$APP_VER\"/" src-tauri/tauri.conf.json
-          sed -i '' "s/\"version\": \"[^\"]*\"/\"version\": \"$APP_VER\"/" package.json
-          sed -i '' "s/pub const APP_VERSION: &str = \"[^\"]*\"/pub const APP_VERSION: \&str = \"$APP_VER\";/" src-tauri/src/lib.rs
+          python3 - <<'PY'
+          import os, re
+          app = os.environ["APP_VER"]
+          # tauri.conf.json
+          p = "src-tauri/tauri.conf.json"
+          s = open(p, encoding="utf-8").read()
+          s = re.sub(r'("version":\s*")[^"]*(")', r'\g<1>' + app + r'\g<2>', s, count=1)
+          open(p, "w", encoding="utf-8").write(s)
+          # package.json
+          p = "package.json"
+          s = open(p, encoding="utf-8").read()
+          s = re.sub(r'("version":\s*")[^"]*(")', r'\g<1>' + app + r'\g<2>', s, count=1)
+          open(p, "w", encoding="utf-8").write(s)
+          # src-tauri/src/lib.rs  (APP_VERSION const)
+          p = "src-tauri/src/lib.rs"
+          s = open(p, encoding="utf-8").read()
+          s = re.sub(r'pub const APP_VERSION: &str = "[^"]*"',
+                     'pub const APP_VERSION: &str = "%s";' % app, s, count=1)
+          open(p, "w", encoding="utf-8").write(s)
+          print("updated all version fields to", app)
+          PY
           grep -n '"version"' src-tauri/tauri.conf.json package.json
           grep -n 'APP_VERSION: &str' src-tauri/src/lib.rs
 
@@ -74,17 +93,9 @@ jobs:
           echo "Bundled xray: ${VER}"
 
       - name: Build universal Tauri app (macOS ARM + Intel)
-        run: npm run tauri build -- --target universal-apple-darwin 2>&1 | tee build.log
+        run: npm run tauri build -- --target universal-apple-darwin
         env:
           CI: true
-
-      - name: Upload build log on failure
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: lionray-build-log
-          path: build.log
-          if-no-files-found: ignore
 
       - name: Upload dmg / pkg artifacts
         uses: actions/upload-artifact@v4
