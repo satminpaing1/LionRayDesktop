@@ -1324,6 +1324,49 @@ fn check_update() -> Result<Option<String>, String> {
     }
 }
 
+// ─── persistent key/value store (file in app data dir) ───
+// Replaces the previous localStorage approach: WKWebView in Tauri v2 does not
+// reliably persist localStorage across app restarts, so saved keys vanished.
+fn store_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir.join("store.json"))
+}
+
+#[tauri::command]
+fn load_store(app: tauri::AppHandle, key: String) -> Result<Option<String>, String> {
+    let path = store_path(&app)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let s = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let map: Value = serde_json::from_str(&s).unwrap_or(Value::Null);
+    Ok(map
+        .get(key.as_str())
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string()))
+}
+
+#[tauri::command]
+fn save_store(app: tauri::AppHandle, key: String, value: String) -> Result<(), String> {
+    let path = store_path(&app)?;
+    let mut map: Value = if path.exists() {
+        let s = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        serde_json::from_str(&s).unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
+    if !map.is_object() {
+        map = Value::Object(serde_json::Map::new());
+    }
+    map.as_object_mut()
+        .unwrap()
+        .insert(key, Value::String(value));
+    std::fs::write(&path, serde_json::to_string(&map).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1345,6 +1388,8 @@ pub fn run() {
             get_core_version,
             check_update,
             check_xray_core_update,
+            load_store,
+            save_store,
             get_download_progress,
             update_xray_core,
             open_link,

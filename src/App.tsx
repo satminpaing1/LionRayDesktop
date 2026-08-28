@@ -95,16 +95,19 @@ const ServerRow = React.memo(function ServerRow({ s, selected, onSelect, onPing,
   );
 });
 
-function load<T>(key: string, fallback: T): T {
+// persistence now goes through the Rust side (a JSON file in the app data
+// dir) — WKWebView's localStorage is not reliable across restarts in Tauri v2.
+async function loadStore<T>(key: string, fallback: T): Promise<T> {
   try {
-    const raw = localStorage.getItem(key);
-    return raw ? JSON.parse(raw) : fallback;
-  } catch {
-    return fallback;
-  }
+    const raw = await invoke<string | null>("load_store", { key });
+    if (raw) return JSON.parse(raw) as T;
+  } catch {}
+  return fallback;
 }
-function save(key: string, val: unknown) {
-  localStorage.setItem(key, JSON.stringify(val));
+async function saveStore(key: string, val: unknown) {
+  try {
+    await invoke("save_store", { key, value: JSON.stringify(val) });
+  } catch {}
 }
 
 function flagEmoji(cc?: string): string {
@@ -231,22 +234,18 @@ function LiveStats() {
 
 function App() {
   const [tab, setTab] = useState<Tab>("home");
-  const [servers, setServers] = useState<Server[]>(() =>
-    (load<Server[]>("lr_servers", []) || []).map((s) => ({
-      ...s,
-      protocol: s.protocol || "vless",
-      security: s.security || "none",
-      network: s.network || "tcp",
-      name: s.name || "Unnamed",
-      address: s.address || "",
-      port: s.port || 443,
-    }))
-  );
-  const [activeId, setActiveId] = useState<number | null>(() => load("lr_active", null));
-  const [subs, setSubs] = useState<Sub[]>(() => load("lr_subs", []) || []);
-  const [settings, setSettings] = useState<Settings>(() =>
-    load("lr_settings", { routing: "lan", dns: "system", adBlock: true, bypassDomains: [], dark: false, autoConnect: false, subAutoUpdate: false })
-  );
+  const [servers, setServers] = useState<Server[]>([]);
+  const [activeId, setActiveId] = useState<number | null>(null);
+  const [subs, setSubs] = useState<Sub[]>([]);
+  const [settings, setSettings] = useState<Settings>({
+    routing: "lan",
+    dns: "system",
+    adBlock: true,
+    bypassDomains: [],
+    dark: false,
+    autoConnect: false,
+    subAutoUpdate: false,
+  });
   const [connected, setConnected] = useState(false);
   const [busy, setBusy] = useState(false);
   const [selBusy, setSelBusy] = useState(false);
@@ -267,6 +266,7 @@ function App() {
   const fileRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const loadedRef = useRef(false);
   const [editing, setEditing] = useState<Server | null>(null);
   const [ef, setEf] = useState<Partial<Server>>({});
   const [sharing, setSharing] = useState<{ srv: Server; uri: string } | null>(null);
@@ -275,10 +275,55 @@ function App() {
   const activeServer = servers.find((s) => s.id === activeId) ?? null;
   const manualServers = useMemo(() => servers.filter((s) => s.subId == null), [servers]);
 
-  useEffect(() => save("lr_servers", servers), [servers]);
-  useEffect(() => save("lr_active", activeId), [activeId]);
-  useEffect(() => save("lr_subs", subs), [subs]);
-  useEffect(() => save("lr_settings", settings), [settings]);
+  // load persisted data from the Rust store on first mount
+  useEffect(() => {
+    (async () => {
+      try {
+        const s = await loadStore<Server[]>("lr_servers", []);
+        setServers(
+          (s || []).map((x) => ({
+            ...x,
+            protocol: x.protocol || "vless",
+            security: x.security || "none",
+            network: x.network || "tcp",
+            name: x.name || "Unnamed",
+            address: x.address || "",
+            port: x.port || 443,
+          }))
+        );
+        setActiveId(await loadStore<number | null>("lr_active", null));
+        setSubs(await loadStore<Sub[]>("lr_subs", []));
+        setSettings(
+          await loadStore<Settings>("lr_settings", {
+            routing: "lan",
+            dns: "system",
+            adBlock: true,
+            bypassDomains: [],
+            dark: false,
+            autoConnect: false,
+            subAutoUpdate: false,
+          })
+        );
+      } catch {
+        /* ignore */
+      }
+      loadedRef.current = true;
+    })();
+  }, []);
+
+  // persist (guarded so the initial empty state doesn't clobber the store)
+  useEffect(() => {
+    if (loadedRef.current) saveStore("lr_servers", servers);
+  }, [servers]);
+  useEffect(() => {
+    if (loadedRef.current) saveStore("lr_active", activeId);
+  }, [activeId]);
+  useEffect(() => {
+    if (loadedRef.current) saveStore("lr_subs", subs);
+  }, [subs]);
+  useEffect(() => {
+    if (loadedRef.current) saveStore("lr_settings", settings);
+  }, [settings]);
   useEffect(() => {
     document.documentElement.classList.toggle("dark", settings.dark);
   }, [settings.dark]);
