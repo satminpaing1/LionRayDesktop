@@ -142,6 +142,93 @@ class ErrorBoundary extends React.Component<
   }
 }
 
+// ─── formatting helpers (module scope: used by App + LiveStats) ───
+const fmtTime = (sec: number) =>
+  `${String(Math.floor(sec / 3600)).padStart(2, "0")}:${String(Math.floor((sec % 3600) / 60)).padStart(2, "0")}:${String(sec % 60).padStart(2, "0")}`;
+
+function fmtBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1048576) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1073741824) return `${(n / 1048576).toFixed(1)} MB`;
+  return `${(n / 1073741824).toFixed(2)} GB`;
+}
+function fmtRate(bps: number): string {
+  return `${fmtBytes(bps)}/s`;
+}
+
+// Live, per-second stats. Isolated here so the parent <App> does NOT
+// re-render every second (important on older macOS / WebKit).
+function LiveStats() {
+  const [elapsed, setElapsed] = useState(0);
+  const [speeds, setSpeeds] = useState({ down: "—", up: "—" });
+  const [totals, setTotals] = useState({ down: 0, up: 0 });
+
+  useEffect(() => {
+    const t = setInterval(() => setElapsed((e) => e + 1), 1000);
+
+    // system-wide speed via sysinfo (always works)
+    let sysT = Date.now();
+    let sysDown = -1;
+    let sysUp = -1;
+    let smDown = 0;
+    let smUp = 0;
+    const A = 0.3; // EMA smoothing
+    const sysPoll = setInterval(async () => {
+      try {
+        const r = await invoke<{ down: number; up: number }>("get_net_speed");
+        const now = Date.now();
+        const dt = Math.max((now - sysT) / 1000, 0.001);
+        if (sysDown >= 0) {
+          const rd = Math.max(0, (r.down - sysDown) / dt);
+          const ru = Math.max(0, (r.up - sysUp) / dt);
+          smDown = smDown ? smDown + A * (rd - smDown) : rd;
+          smUp = smUp ? smUp + A * (ru - smUp) : ru;
+          setSpeeds({ down: fmtRate(smDown), up: fmtRate(smUp) });
+        }
+        sysDown = r.down;
+        sysUp = r.up;
+        sysT = now;
+      } catch { /* ignore */ }
+    }, 1000);
+
+    // xray session totals (for the "Total" row)
+    const tpoll = setInterval(() => {
+      invoke<{ down: number; up: number }>("get_traffic")
+        .then((r) => setTotals({ down: r.down, up: r.up }))
+        .catch(() => {});
+    }, 2000);
+
+    return () => {
+      clearInterval(t);
+      clearInterval(sysPoll);
+      clearInterval(tpoll);
+    };
+  }, []);
+
+  return (
+    <>
+      <div className="power-sub">Session {fmtTime(elapsed)}</div>
+      <div className="speed-row">
+        <div className="speed-box">
+          <span className="speed-ico">⬇</span>
+          <b className="speed-val">{speeds.down}</b>
+          <small>DOWNLOAD</small>
+        </div>
+        <div className="speed-box">
+          <span className="speed-ico up">⬆</span>
+          <b className="speed-val">{speeds.up}</b>
+          <small>UPLOAD</small>
+        </div>
+      </div>
+      {(totals.down > 0 || totals.up > 0) && (
+        <div className="usage-line">
+          Via VPN ⬇ {fmtBytes(totals.down)} · ⬆ {fmtBytes(totals.up)}
+        </div>
+      )}
+    </>
+  );
+}
+
 function App() {
   const [tab, setTab] = useState<Tab>("home");
   const [servers, setServers] = useState<Server[]>(() =>
@@ -168,15 +255,12 @@ function App() {
   const [subUrl, setSubUrl] = useState("");
   const [qrOpen, setQrOpen] = useState(false);
   const [exitInfo, setExitInfo] = useState<ExitInfo | null>(null);
-  const [elapsed, setElapsed] = useState(0);
   const [coreVer, setCoreVer] = useState("...");
   const [xrayUpdate, setXrayUpdate] = useState<{ version: string; url: string } | null>(null);
   const [xrayUpdating, setXrayUpdating] = useState(false);
   const [xrayProgress, setXrayProgress] = useState(0);
   const [xrayCheckMsg, setXrayCheckMsg] = useState("");
   const [confirmDlg, setConfirmDlg] = useState<{ msg: string; onOk: () => void } | null>(null);
-  const [totals, setTotals] = useState({ down: 0, up: 0 });
-  const [speeds, setSpeeds] = useState({ down: "—", up: "—" });
   const [bypassInput, setBypassInput] = useState("");
   const [lastSrv, setLastSrv] = useState<Server | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -294,48 +378,17 @@ function App() {
     };
   }, []);
 
-  // ─── session timer + exit ip + traffic speeds + heartbeat ───
+  // ─── exit-ip lookup (15s) + auto-reconnect heartbeat (5s) ───
+  // NOTE: live per-second stats (elapsed / speeds / totals) live in the
+  // <LiveStats> child so the whole App no longer re-renders every tick.
   useEffect(() => {
     if (!connected) return;
-    const t = setInterval(() => setElapsed((e) => e + 1), 1000);
     const check = () =>
       invoke<ExitInfo>("check_exit_ip")
         .then((j) => setExitInfo(j))
         .catch(() => {});
     const first = setTimeout(check, 1500);
     const poll = setInterval(check, 15000);
-
-    // system-wide speed via sysinfo (always works)
-    let sysT = Date.now();
-    let sysDown = -1;
-    let sysUp = -1;
-    let smDown = 0;
-    let smUp = 0;
-    const A = 0.3;                            // EMA smoothing
-    const sysPoll = setInterval(async () => {
-      try {
-        const r = await invoke<{ down: number; up: number }>("get_net_speed");
-        const now = Date.now();
-        const dt = Math.max((now - sysT) / 1000, 0.001);
-        if (sysDown >= 0) {
-          const rd = Math.max(0, (r.down - sysDown) / dt);
-          const ru = Math.max(0, (r.up - sysUp) / dt);
-          smDown = smDown ? smDown + A * (rd - smDown) : rd;
-          smUp   = smUp   ? smUp   + A * (ru - smUp)   : ru;
-          setSpeeds({ down: fmtRate(smDown), up: fmtRate(smUp) });
-        }
-        sysDown = r.down;
-        sysUp = r.up;
-        sysT = now;
-      } catch { /* ignore */ }
-    }, 1000);
-
-    // xray session totals (for the "Total" row)
-    const tpoll = setInterval(() => {
-      invoke<{ down: number; up: number }>("get_traffic")
-        .then((r) => setTotals({ down: r.down, up: r.up }))
-        .catch(() => {});
-    }, 2000);
 
     // heartbeat: check if xray is alive every 5s; auto-reconnect on drop
     let wasDisconnected = false;
@@ -345,7 +398,6 @@ function App() {
         if (!alive && !wasDisconnected) {
           wasDisconnected = true;
           setConnected(false);
-          setExitInfo(null);
           showToast("Connection lost — reconnecting…", true);
           // retry every 3s until network is back
           const retry = async () => {
@@ -361,7 +413,6 @@ function App() {
               });
               setConnected(true);
               wasDisconnected = false;
-              setElapsed(0);
               showToast("Reconnected ✓");
             } catch {
               setTimeout(retry, 3000);
@@ -373,11 +424,8 @@ function App() {
     }, 5000);
 
     return () => {
-      clearInterval(t);
       clearTimeout(first);
       clearInterval(poll);
-      clearInterval(sysPoll);
-      clearInterval(tpoll);
       clearInterval(heartbeat);
     };
   }, [connected, lastSrv, settings]);
@@ -600,9 +648,6 @@ function App() {
         await invoke("disconnect");
         setConnected(false);
         setExitInfo(null);
-        setElapsed(0);
-        setTotals({ down: 0, up: 0 });
-        setSpeeds({ down: "—", up: "—" });
         setLastSrv(null);
         showToast("Disconnected");
       } catch (e) {
@@ -771,19 +816,6 @@ function App() {
       .catch((e) => showToast(String(e), true));
   };
 
-  const fmtTime = (sec: number) =>
-    `${String(Math.floor(sec / 3600)).padStart(2, "0")}:${String(Math.floor((sec % 3600) / 60)).padStart(2, "0")}:${String(sec % 60).padStart(2, "0")}`;
-
-  function fmtBytes(n: number): string {
-    if (n < 1024) return `${n} B`;
-    if (n < 1048576) return `${(n / 1024).toFixed(1)} KB`;
-    if (n < 1073741824) return `${(n / 1048576).toFixed(1)} MB`;
-    return `${(n / 1073741824).toFixed(2)} GB`;
-  }
-  function fmtRate(bps: number): string {
-    return `${fmtBytes(bps)}/s`;
-  }
-
   const doXrayUpdate = async (url: string) => {
     setConfirmDlg({
       msg: "Download & replace xray core?\nApp will need restart after.",
@@ -867,29 +899,10 @@ function App() {
               {connected ? "CONNECTED" : "NOT CONNECTED"}
             </div>
             <div className="power-sub">
-              {connected ? `Session ${fmtTime(elapsed)}` : settings.autoConnect ? "Auto-connect enabled" : "Tap the button to connect"}
+              {connected ? "VPN tunnel active" : settings.autoConnect ? "Auto-connect enabled" : "Tap the button to connect"}
             </div>
 
-            {connected && (
-              <div className="speed-row">
-                <div className="speed-box">
-                  <span className="speed-ico">⬇</span>
-                  <b className="speed-val">{speeds.down}</b>
-                  <small>DOWNLOAD</small>
-                </div>
-                <div className="speed-box">
-                  <span className="speed-ico up">⬆</span>
-                  <b className="speed-val">{speeds.up}</b>
-                  <small>UPLOAD</small>
-                </div>
-              </div>
-            )}
-
-            {connected && (totals.down > 0 || totals.up > 0) && (
-              <div className="usage-line">
-                Via VPN ⬇ {fmtBytes(totals.down)} · ⬆ {fmtBytes(totals.up)}
-              </div>
-            )}
+            {connected && <LiveStats />}
 
             {connected && exitInfo?.query && (
               <div className="exit-chip" title={exitInfo.isp || ""}>
