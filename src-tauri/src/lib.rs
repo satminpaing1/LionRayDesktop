@@ -177,8 +177,8 @@ fn import_bulk(uris: Vec<String>) -> Vec<Server> {
 }
 
 #[tauri::command]
-fn fetch_subscription(url: String) -> Result<Vec<Server>, String> {
-    let body = http_get(url.trim())?;
+async fn fetch_subscription(url: String) -> Result<Vec<Server>, String> {
+    let body = http_get(url.trim()).await?;
     let text = b64_decode_flexible(&body).filter(|s| s.contains("://")).unwrap_or(body);
     let servers: Vec<Server> = text
         .lines()
@@ -195,7 +195,7 @@ fn fetch_subscription(url: String) -> Result<Vec<Server>, String> {
 
 #[tauri::command]
 async fn fetch_subscription_stream(url: String, on_server: tauri::ipc::Channel<Server>) -> Result<(), String> {
-    let body = http_get(url.trim())?;
+    let body = http_get(url.trim()).await?;
     let text = b64_decode_flexible(&body).filter(|s| s.contains("://")).unwrap_or(body);
     let mut count = 0u32;
     for line in text.lines() {
