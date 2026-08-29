@@ -1291,6 +1291,14 @@ fn get_core_version() -> Result<String, String> {
     Ok(ver)
 }
 
+// Real, stamped app version (overwritten by the build workflow via sed).
+// Read through this command instead of the @tauri-apps/api/app plugin so it
+// works without extra capability permissions.
+#[tauri::command]
+fn app_version() -> String {
+    APP_VERSION.to_string()
+}
+
 fn parse_ver(s: &str) -> Vec<u32> {
     s.trim_start_matches('v')
         .split('.')
@@ -1389,6 +1397,7 @@ pub fn run() {
             get_traffic,
             get_net_speed,
             get_core_version,
+            app_version,
             check_update,
             check_xray_core_update,
             load_store,

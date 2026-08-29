@@ -1,7 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { getCurrentWindow, currentMonitor, LogicalSize } from "@tauri-apps/api/window";
-import { getVersion } from "@tauri-apps/api/app";
 
 import jsQR from "jsqr";
 import QRCode from "qrcode";
@@ -269,6 +268,9 @@ function App() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const loadedRef = useRef(false);
+  // set while a manual disconnect is in progress so the heartbeat's
+  // auto-reconnect doesn't fire on the brief "xray is dead" window
+  const manualDisconnectRef = useRef(false);
   const [editing, setEditing] = useState<Server | null>(null);
   const [ef, setEf] = useState<Partial<Server>>({});
   const [sharing, setSharing] = useState<{ srv: Server; uri: string } | null>(null);
@@ -282,7 +284,7 @@ function App() {
   useEffect(() => {
     (async () => {
       try {
-        getVersion().then(setAppVer).catch(() => {});
+        invoke<string>("app_version").then(setAppVer).catch(() => {});
         const s = await loadStore<Server[]>("lr_servers", []);
         setServers(
           (s || []).map((x) => ({
@@ -464,12 +466,13 @@ function App() {
     const heartbeat = setInterval(async () => {
       try {
         const alive = await invoke<boolean>("is_connected");
-        if (!alive && !wasDisconnected) {
+        if (!alive && !wasDisconnected && !manualDisconnectRef.current) {
           wasDisconnected = true;
           setConnected(false);
           showToast("Connection lost — reconnecting…", true);
           // retry every 3s until network is back
           const retry = async () => {
+            if (manualDisconnectRef.current) return;
             const srv = lastSrv;
             if (!srv) return;
             try {
@@ -713,6 +716,7 @@ function App() {
     if (busy) return;
     if (connected) {
       setBusy(true);
+      manualDisconnectRef.current = true;
       try {
         await invoke("disconnect");
         setConnected(false);
@@ -723,6 +727,7 @@ function App() {
         showToast(String(e), true);
       }
       setBusy(false);
+      manualDisconnectRef.current = false;
       return;
     }
     if (!activeServer) {
