@@ -211,6 +211,8 @@ body {
   display: flex; align-items: center; gap: 9px;
   background: var(--card); border: 1.5px solid var(--line);
   border-radius: 14px; padding: 10px 12px; cursor: pointer; transition: all .13s;
+  /* skip painting offscreen rows — big scroll win on Intel Macs with long lists */
+  content-visibility: auto; contain-intrinsic-size: auto 58px;
 }
 .row:hover { border-color: var(--primary); }
 .row.sel { border-color: var(--primary); background: var(--primary-soft); }
@@ -245,6 +247,7 @@ body {
 .sub-card {
   background: var(--card); border: 1px solid var(--line);
   border-radius: 16px; padding: 13px 15px;
+  content-visibility: auto; contain-intrinsic-size: auto 86px;
 }
 .sub-head { display: flex; align-items: center; justify-content: space-between; }
 .sub-name { font-size: 14.5px; font-weight: 700; }
@@ -446,8 +449,7 @@ input:checked + .slider::before { transform: translateX(20px); }
 
 /* modal overlay + modal */
 .modal-overlay {
-  position: fixed; inset: 0; background: rgba(6,10,22,.68);
-  backdrop-filter: blur(2px);
+  position: fixed; inset: 0; background: rgba(6,10,22,.78);
   z-index: 80; display: flex; align-items: center; justify-content: center;
   padding: 20px; animation: fadeIn .15s ease;
 }
