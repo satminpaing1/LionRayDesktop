@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { getCurrentWindow, currentMonitor, LogicalSize } from "@tauri-apps/api/window";
+import { getVersion } from "@tauri-apps/api/app";
 
 import jsQR from "jsqr";
 import QRCode from "qrcode";
@@ -57,7 +58,8 @@ type Tab = "home" | "servers" | "subs" | "settings";
 type SheetMode = null | "menu" | "sub";
 
 const PROTO_COLORS: Record<string, string> = { vless: "#6366F1", trojan: "#F59E0B", shadowsocks: "#10B981" };
-const APP_VER = "1.6.0";
+// App Version is read from Tauri at runtime (the appVer state) so the
+// Settings screen always shows the real, stamped build version.
 let idCounter = Date.now() % 100000;
 
 const pingColor = (ms: number | null): string =>
@@ -271,6 +273,7 @@ function App() {
   const [ef, setEf] = useState<Partial<Server>>({});
   const [sharing, setSharing] = useState<{ srv: Server; uri: string } | null>(null);
   const [qrUrl, setQrUrl] = useState("");
+  const [appVer, setAppVer] = useState("…");
 
   const activeServer = servers.find((s) => s.id === activeId) ?? null;
   const manualServers = useMemo(() => servers.filter((s) => s.subId == null), [servers]);
@@ -279,6 +282,7 @@ function App() {
   useEffect(() => {
     (async () => {
       try {
+        getVersion().then(setAppVer).catch(() => {});
         const s = await loadStore<Server[]>("lr_servers", []);
         setServers(
           (s || []).map((x) => ({
@@ -1256,7 +1260,7 @@ function App() {
                 </b>
               </div>
               <div className="hr" />
-              <div className="kv"><span>App Version</span><b>{APP_VER}</b></div>
+              <div className="kv"><span>App Version</span><b>{appVer}</b></div>
             </div>
 
             <div className="sec">Xray Core Update</div>
