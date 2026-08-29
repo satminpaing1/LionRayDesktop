@@ -390,6 +390,10 @@ function App() {
       const msg = typeof e === "string" ? e : e?.message || "Check failed";
       setXrayCheckMsg(`Error: ${msg.slice(0, 100)}`);
     }
+    // also surface any available APP update (shown as a global banner)
+    invoke<string | null>("check_update")
+      .then((t) => { if (t) setAppUpdate(t); })
+      .catch(() => {});
   };
 
   useEffect(() => {
@@ -408,8 +412,14 @@ function App() {
 
   // auto-check xray update when settings tab opens
   useEffect(() => {
-    if (tab === "settings" && !xrayUpdate && !xrayUpdating) {
-      checkXrayUpdate();
+    if (tab === "settings") {
+      // always re-check for an available app update (shows the global banner)
+      invoke<string | null>("check_update")
+        .then((t) => { if (t) setAppUpdate(t); })
+        .catch(() => {});
+      if (!xrayUpdate && !xrayUpdating) {
+        checkXrayUpdate();
+      }
     }
   }, [tab]);
 
@@ -918,6 +928,19 @@ function App() {
         <div className={`toast ${toast.bad ? "bad" : ""}`}>{toast.msg}</div>
       )}
 
+      {appUpdate && (
+        <div
+          className="update-banner"
+          onClick={() =>
+            invoke("open_link", {
+              url: "https://github.com/satminpaing1/LionRayDesktop/releases/latest",
+            })
+          }
+        >
+          ⬆ New version {appUpdate} available — tap to download
+        </div>
+      )}
+
       {/* ═══════════ HOME ═══════════ */}
       {tab === "home" && (
         <>
@@ -925,19 +948,6 @@ function App() {
             <span className="logo">🦁 LionRay</span>
             <RoutingIcon />
           </header>
-
-          {appUpdate && (
-            <div
-              className="update-banner"
-              onClick={() =>
-                invoke("open_link", {
-                  url: "https://github.com/satminpaing1/LionRayDesktop/releases/latest",
-                })
-              }
-            >
-              ⬆ New version {appUpdate} available — tap to download
-            </div>
-          )}
 
           {/* node card */}
           <div className="node-card" onClick={() => setTab("servers")}>
