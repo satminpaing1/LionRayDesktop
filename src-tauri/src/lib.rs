@@ -99,12 +99,15 @@ fn socks_listening() -> bool {
     }
 }
 
-fn http_get(url: &str) -> Result<String, String> {
+// Runs a blocking HTTP request OFF the async runtime (spawn_blocking) so a
+// slow external host (api.github.com / ip-api) can never stall the worker
+// thread that also serves the per-second stats + connect/disconnect IPC.
+async fn http_get(url: &str) -> Result<String, String> {
     let url = url.to_string();
-    std::thread::spawn(move || {
+    tokio::task::spawn_blocking(move || {
         let client = reqwest::blocking::Client::builder()
             .user_agent("LionRayVPN/1.2")
-            .timeout(std::time::Duration::from_secs(20))
+            .timeout(std::time::Duration::from_secs(8))
             .build()
             .map_err(|e| e.to_string())?;
         client
@@ -114,7 +117,7 @@ fn http_get(url: &str) -> Result<String, String> {
             .text()
             .map_err(|e| e.to_string())
     })
-    .join()
+    .await
     .map_err(|_| "worker panicked".to_string())?
 }
 
@@ -1006,8 +1009,8 @@ fn ping_server(address: String, port: u16) -> Result<u64, String> {
 }
 
 #[tauri::command]
-fn check_exit_ip() -> Result<Value, String> {
-    std::thread::spawn(move || {
+async fn check_exit_ip() -> Result<Value, String> {
+    tokio::task::spawn_blocking(move || {
         let proxy = reqwest::Proxy::all(format!("socks5h://127.0.0.1:{SOCKS_PORT}")).map_err(|e| e.to_string())?;
         let proxied = reqwest::blocking::Client::builder()
             .proxy(proxy)
@@ -1053,7 +1056,7 @@ fn check_exit_ip() -> Result<Value, String> {
             "isp": geo["isp"]
         }))
     })
-    .join()
+    .await
     .map_err(|_| "worker panicked".to_string())?
 }
 
@@ -1111,8 +1114,8 @@ fn get_net_speed() -> Result<Value, String> {
 }
 
 #[tauri::command]
-fn check_xray_core_update() -> Result<Option<Value>, String> {
-    let body = http_get("https://api.github.com/repos/XTLS/Xray-core/releases/latest")?;
+async fn check_xray_core_update() -> Result<Option<Value>, String> {
+    let body = http_get("https://api.github.com/repos/XTLS/Xray-core/releases/latest").await?;
     let v: Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
     let tag = v["tag_name"].as_str().unwrap_or("").to_string();
     if tag.is_empty() { return Ok(None); }
@@ -1311,8 +1314,8 @@ fn ver_gt(a: &str, b: &str) -> bool {
 }
 
 #[tauri::command]
-fn check_update() -> Result<Option<String>, String> {
-    let body = http_get("https://api.github.com/repos/satminpaing1/LionRayDesktop/releases/latest")?;
+async fn check_update() -> Result<Option<String>, String> {
+    let body = http_get("https://api.github.com/repos/satminpaing1/LionRayDesktop/releases/latest").await?;
     let v: Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
     let tag = v["tag_name"].as_str().unwrap_or("").to_string();
     if tag.is_empty() {
