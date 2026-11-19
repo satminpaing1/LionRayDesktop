@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.7.9";
+pub const APP_VERSION: &str = "1.8.0";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -57,6 +57,10 @@ pub struct Server {
     pub ws_path: String,
     pub ws_host: String,
     pub grpc_service_name: String,
+    /// Raw `fragment=` share-link parameter (TLS ClientHello fragmentation).
+    /// Shadowrocket format: `<flag>,<length>,<interval>[,packets]`
+    /// e.g. `1,40-60,30-50,tlshello`.
+    pub fragment: String,
 }
 
 // ───────────────────────── helpers ─────────────────────────
@@ -342,6 +346,9 @@ fn build_uri(s: &Server) -> Result<String, String> {
             if !s.grpc_service_name.is_empty() {
                 q.push(format!("serviceName={}", s.grpc_service_name));
             }
+            if !s.fragment.is_empty() {
+                q.push(format!("fragment={}", urlencoding::encode(&s.fragment)));
+            }
             if !s.flow.is_empty() && s.protocol == "vless" {
                 q.push(format!("flow={}", s.flow));
             }
@@ -463,6 +470,7 @@ fn parse_vless(uri: &str) -> Result<Server, String> {
         ws_path: g("path"),
         ws_host: g("host"),
         grpc_service_name: g("serviceName"),
+        fragment: g("fragment"),
         ..base_server(String::new(), "vless")
     })
 }
@@ -499,6 +507,7 @@ fn parse_trojan(uri: &str) -> Result<Server, String> {
         ws_path: g("path"),
         ws_host: g("host"),
         grpc_service_name: g("serviceName"),
+        fragment: g("fragment"),
         ..base_server(String::new(), "trojan")
     })
 }
@@ -687,6 +696,104 @@ fn build_outbound_settings(server: &Server) -> Result<Value, String> {
     }
 }
 
+fn is_fragment_range(value: &str) -> bool {
+    let numeric = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+    match value.split_once('-') {
+        Some((a, b)) => numeric(a.trim()) && numeric(b.trim()),
+        None => numeric(value.trim()),
+    }
+}
+
+fn is_fragment_number(value: &str) -> bool {
+    let v = value.trim();
+    !v.is_empty() && v.chars().all(|c| c.is_ascii_digit())
+}
+
+struct FragmentSpec {
+    packets: String,
+    length: String,
+    interval: String,
+}
+
+/// Parse the share-link `fragment=` parameter into Xray freedom fragment
+/// settings. Supports both common layouts:
+///   * Shadowrocket: `<flag>,<length>,<interval>[,tlshello]` (e.g. `1,40-60,30-50,tlshello`)
+///   * Happ/others:  `<length>,<interval>,tlshello` (e.g. `3,1,tlshello`)
+/// The first Shadowrocket field is an enable flag, not a fragment size.
+fn parse_fragment_spec(spec: &str) -> Option<FragmentSpec> {
+    let parts: Vec<&str> = spec
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
+    if parts.len() < 2 {
+        return None;
+    }
+
+    // `tlshello,<length>,<interval>` variant.
+    if parts[0].eq_ignore_ascii_case("tlshello") {
+        if parts.len() >= 3 && is_fragment_range(parts[1]) && is_fragment_range(parts[2]) {
+            return Some(FragmentSpec {
+                packets: "tlshello".into(),
+                length: parts[1].into(),
+                interval: parts[2].into(),
+            });
+        }
+        return None;
+    }
+
+    let body: &[&str] = match parts.split_last() {
+        Some((last, rest)) if last.eq_ignore_ascii_case("tlshello") => rest,
+        _ => &parts,
+    };
+
+    let (length, interval) = match body.len() {
+        2 => (body[0], body[1]),
+        3 => {
+            // Shadowrocket puts a flag first: `1,40-60,30-50`.
+            let flag_form = is_fragment_number(body[0])
+                && is_fragment_range(body[1])
+                && is_fragment_range(body[2])
+                && (body[1].contains('-') || body[2].contains('-'));
+            if flag_form {
+                if body[0].trim() == "0" {
+                    return None;
+                }
+                (body[1], body[2])
+            } else {
+                (body[0], body[1])
+            }
+        }
+        _ => return None,
+    };
+
+    if !is_fragment_range(length) || !is_fragment_range(interval) {
+        return None;
+    }
+    // Long inter-fragment waits (Shadowrocket presets use 30-50 ms) add more
+    // than a second to every TLS handshake: a ~1.5 KB ClientHello split into
+    // 40-60 byte records waits once per record. The splitting itself is what
+    // defeats DPI, so keep it but cap the wait to stay responsive.
+    let interval = if range_max(interval) > 5 {
+        "1-3".to_string()
+    } else {
+        interval.to_string()
+    };
+    Some(FragmentSpec {
+        packets: "tlshello".into(),
+        length: length.into(),
+        interval,
+    })
+}
+
+fn range_max(value: &str) -> u64 {
+    value
+        .split('-')
+        .next_back()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0)
+}
+
 fn generate_config(server: &Server, routing: &str, dns: &str, ad_block: bool, bypass_domains: &[String]) -> Result<String, String> {
     let mut rules = vec![];
 
@@ -733,26 +840,62 @@ fn generate_config(server: &Server, routing: &str, dns: &str, ad_block: bool, by
         "outboundTag": "api"
     }));
 
-    // build DNS section
-    let dns_section = match dns {
-        "google" => json!({ "servers": ["8.8.8.8", "8.8.4.4"] }),
-        "cloudflare" => json!({ "servers": ["1.1.1.1", "1.0.0.1"] }),
-        "quad9" => json!({ "servers": ["9.9.9.9", "149.112.112.112"] }),
-        "adguard" => json!({ "servers": ["94.140.14.14", "94.140.15.15"] }),
-        "custom" => json!({ "servers": ["8.8.8.8"] }),
-        _ => json!({ "servers": ["8.8.8.8"] }), // "system" or unknown → use Google as default
+    // Build the DNS section. "system" must truly use the OS resolver: emitting
+    // a plaintext 8.8.8.8 resolver here used to make every outbound lookup
+    // depend on a reachable public DNS, which stalls badly on networks that
+    // block UDP/53.
+    let explicit_dns = match dns {
+        "system" | "" => None,
+        "google" => Some(json!({ "servers": ["8.8.8.8", "8.8.4.4"] })),
+        "cloudflare" => Some(json!({ "servers": ["1.1.1.1", "1.0.0.1"] })),
+        "quad9" => Some(json!({ "servers": ["9.9.9.9", "149.112.112.112"] })),
+        "adguard" => Some(json!({ "servers": ["94.140.14.14", "94.140.15.15"] })),
+        "custom" => Some(json!({ "servers": ["8.8.8.8"] })),
+        _ => None,
     };
 
-    let routing_domain_strategy = if dns != "system" { "IPIfNonMatch" } else { "AsIs" };
+    let routing_domain_strategy = if explicit_dns.is_some() { "IPIfNonMatch" } else { "AsIs" };
 
-    let config = json!({
+    // TLS ClientHello fragmentation requested by the share link: the proxy
+    // outbound dials through a freedom outbound that fragments the handshake.
+    // Only meaningful when the transport is actually TLS.
+    let fragment = match server.security.as_str() {
+        "tls" | "reality" => parse_fragment_spec(&server.fragment),
+        _ => None,
+    };
+    let mut proxy_stream = build_stream(server);
+    let mut outbounds = Vec::new();
+    if let Some(f) = fragment {
+        proxy_stream["sockopt"] = json!({ "dialerProxy": "fragment" });
+        outbounds.push(json!({
+            "tag": "fragment",
+            "protocol": "freedom",
+            "settings": {
+                "fragment": {
+                    "packets": f.packets,
+                    "length": f.length,
+                    "interval": f.interval
+                }
+            },
+            "streamSettings": { "sockopt": { "tcpNoDelay": true } }
+        }));
+    }
+    outbounds.push(json!({
+        "tag": "proxy",
+        "protocol": server.protocol,
+        "settings": build_outbound_settings(server)?,
+        "streamSettings": proxy_stream
+    }));
+    outbounds.push(json!({ "tag": "direct", "protocol": "freedom" }));
+    outbounds.push(json!({ "tag": "block", "protocol": "blackhole" }));
+
+    let mut config = json!({
         "log": { "loglevel": "warning" },
         "stats": {},
         "api": {
             "tag": "api",
             "services": ["StatsService"]
         },
-        "dns": dns_section,
         "inbounds": [
             {
                 "tag": "socks-in",
@@ -776,21 +919,15 @@ fn generate_config(server: &Server, routing: &str, dns: &str, ad_block: bool, by
                 "settings": { "address": "127.0.0.1" }
             }
         ],
-        "outbounds": [
-            {
-                "tag": "proxy",
-                "protocol": server.protocol,
-                "settings": build_outbound_settings(server)?,
-                "streamSettings": build_stream(server)
-            },
-            { "tag": "direct", "protocol": "freedom" },
-            { "tag": "block", "protocol": "blackhole" }
-        ],
+        "outbounds": outbounds,
         "routing": {
             "domainStrategy": routing_domain_strategy,
             "rules": rules
         }
     });
+    if let Some(dns_section) = explicit_dns {
+        config["dns"] = dns_section;
+    }
     serde_json::to_string_pretty(&config).map_err(|e| e.to_string())
 }
 
@@ -1223,6 +1360,126 @@ async fn relaunch_as_admin(app: tauri::AppHandle) -> Result<(), String> {
 // Core connect logic shared by the `connect` command and the auto-reconnect
 // watchdog. Brings up xray, applies the system proxy and keeps the box awake.
 // Returns Err if xray failed to start / exited immediately.
+fn is_ip_literal(host: &str) -> bool {
+    host.parse::<std::net::IpAddr>().is_ok()
+}
+
+// Last known-good address per proxy hostname. Windows/ISP DNS occasionally
+// answers NXDOMAIN for perfectly valid hosts; falling back to the cached IP
+// keeps reconnects instant instead of leaving the UI stuck for seconds.
+static DNS_CACHE: Mutex<Option<std::collections::HashMap<String, (String, std::time::Instant)>>> =
+    Mutex::new(None);
+const DNS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+fn cache_dns(host: &str, ip: &str) {
+    if let Ok(mut guard) = DNS_CACHE.lock() {
+        let map = guard.get_or_insert_with(std::collections::HashMap::new);
+        map.insert(host.to_string(), (ip.to_string(), std::time::Instant::now()));
+    }
+}
+
+fn cached_dns(host: &str) -> Option<String> {
+    let guard = DNS_CACHE.lock().ok()?;
+    let map = guard.as_ref()?;
+    let (ip, at) = map.get(host)?;
+    if at.elapsed() <= DNS_CACHE_TTL {
+        Some(ip.clone())
+    } else {
+        None
+    }
+}
+
+/// System resolver with a hard time budget, so a stalled lookup cannot freeze
+/// the connect flow. Prefers IPv4 (these tunnels are almost always IPv4).
+fn system_lookup(host: &str, port: u16, budget: std::time::Duration) -> Option<String> {
+    use std::net::ToSocketAddrs;
+    let host = host.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let found = (host.as_str(), port).to_socket_addrs().ok().and_then(|addrs| {
+            let mut v6 = None;
+            for addr in addrs {
+                match addr.ip() {
+                    std::net::IpAddr::V4(ip) => return Some(ip.to_string()),
+                    std::net::IpAddr::V6(ip) => {
+                        if v6.is_none() {
+                            v6 = Some(ip.to_string());
+                        }
+                    }
+                }
+            }
+            v6
+        });
+        let _ = tx.send(found);
+    });
+    rx.recv_timeout(budget).ok().flatten()
+}
+
+/// DNS-over-HTTPS fallback for networks whose plain DNS misbehaves. Runs on a
+/// plain OS thread so the blocking HTTP client never sees a Tokio runtime
+/// context, and is bounded by a hard timeout.
+fn doh_lookup(host: &str) -> Option<String> {
+    let host = host.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(doh_lookup_blocking(&host));
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(7))
+        .ok()
+        .flatten()
+}
+
+fn doh_lookup_blocking(host: &str) -> Option<String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .ok()?;
+    let name = urlencoding::encode(host);
+    for url in [
+        format!("https://cloudflare-dns.com/dns-query?name={name}&type=A"),
+        format!("https://dns.google/resolve?name={name}&type=A"),
+    ] {
+        let Ok(resp) = client.get(&url).header("accept", "application/dns-json").send() else {
+            continue;
+        };
+        let Ok(body) = resp.json::<Value>() else { continue };
+        if let Some(answers) = body.get("Answer").and_then(|a| a.as_array()) {
+            for record in answers {
+                if record.get("type").and_then(|t| t.as_u64()) != Some(1) {
+                    continue;
+                }
+                if let Some(data) = record.get("data").and_then(|d| d.as_str()) {
+                    if data.parse::<std::net::Ipv4Addr>().is_ok() {
+                        return Some(data.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Resolve the proxy hostname once before xray starts so the core dials a
+/// cached IP while keeping SNI/Host unchanged. Falls back to the last known
+/// address, then DoH.
+fn resolve_server_address(server: &Server) -> Option<String> {
+    if is_ip_literal(&server.address) {
+        return None;
+    }
+    if let Some(ip) = system_lookup(&server.address, server.port, std::time::Duration::from_millis(1500)) {
+        cache_dns(&server.address, &ip);
+        return Some(ip);
+    }
+    if let Some(ip) = cached_dns(&server.address) {
+        return Some(ip);
+    }
+    if let Some(ip) = doh_lookup(&server.address) {
+        cache_dns(&server.address, &ip);
+        return Some(ip);
+    }
+    None
+}
+
 fn establish(
     server: &Server,
     routing: &str,
@@ -1240,7 +1497,17 @@ fn establish(
         }
     }
 
-    let config = generate_config(server, routing, dns, ad_block, bypass)?;
+    // Preserve the hostname for TLS/SNI and the WS Host header even though the
+    // socket itself will dial a pre-resolved address.
+    let mut dial_server = server.clone();
+    if dial_server.sni.is_empty() {
+        dial_server.sni = dial_server.address.clone();
+    }
+    if let Some(ip) = resolve_server_address(server) {
+        dial_server.address = ip;
+    }
+
+    let config = generate_config(&dial_server, routing, dns, ad_block, bypass)?;
 
     let config_dir = dirs::config_dir()
         .ok_or("no config dir")?
@@ -1992,4 +2259,99 @@ pub fn run() {
             }
             let _ = app_handle;
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user_server() -> Server {
+        Server {
+            protocol: "vless".into(),
+            address: "smp.settminpaing.mm.am".into(),
+            port: 443,
+            uuid: "5f487d99-05c7-4f7c-8b18-987c247d716e".into(),
+            network: "ws".into(),
+            security: "tls".into(),
+            sni: "smp.settminpaing.mm.am".into(),
+            fingerprint: "chrome".into(),
+            ws_path: "/?ed=2560".into(),
+            ws_host: "smp.settminpaing.mm.am".into(),
+            fragment: "1,40-60,30-50,tlshello".into(),
+            ..Server::default()
+        }
+    }
+
+    #[test]
+    fn fragment_parses_shadowrocket_format() {
+        let spec = parse_fragment_spec("1,40-60,30-50,tlshello").expect("spec");
+        assert_eq!(spec.packets, "tlshello");
+        assert_eq!(spec.length, "40-60");
+        // long Shadowrocket waits are capped so the handshake stays fast
+        assert_eq!(spec.interval, "1-3");
+        assert!(parse_fragment_spec("0,40-60,30-50").is_none());
+        assert!(parse_fragment_spec("").is_none());
+    }
+
+    #[test]
+    fn config_routes_proxy_through_fragment_outbound() {
+        let cfg: Value = serde_json::from_str(
+            &generate_config(&user_server(), "global", "system", false, &[]).unwrap(),
+        )
+        .unwrap();
+        let outbounds = cfg["outbounds"].as_array().unwrap();
+        assert_eq!(outbounds[0]["tag"], "fragment");
+        assert_eq!(outbounds[0]["settings"]["fragment"]["packets"], "tlshello");
+        assert_eq!(outbounds[0]["settings"]["fragment"]["length"], "40-60");
+        assert_eq!(outbounds[0]["settings"]["fragment"]["interval"], "1-3");
+        assert_eq!(
+            outbounds[1]["streamSettings"]["sockopt"]["dialerProxy"],
+            "fragment"
+        );
+        // SNI and WS Host stay on the hostname
+        assert_eq!(
+            outbounds[1]["streamSettings"]["tlsSettings"]["serverName"],
+            "smp.settminpaing.mm.am"
+        );
+        assert_eq!(
+            outbounds[1]["streamSettings"]["wsSettings"]["headers"]["Host"],
+            "smp.settminpaing.mm.am"
+        );
+        assert_eq!(
+            outbounds[1]["streamSettings"]["wsSettings"]["path"],
+            "/?ed=2560"
+        );
+    }
+
+    #[test]
+    fn fragment_is_ignored_for_plaintext_transport() {
+        let mut s = user_server();
+        s.security = "none".into();
+        let cfg = generate_config(&s, "global", "system", false, &[]).unwrap();
+        assert!(!cfg.contains("\"fragment\""));
+    }
+
+    #[test]
+    fn system_dns_uses_os_resolver() {
+        let cfg: Value = serde_json::from_str(
+            &generate_config(&user_server(), "global", "system", false, &[]).unwrap(),
+        )
+        .unwrap();
+        assert!(cfg.get("dns").is_none());
+        assert_eq!(cfg["routing"]["domainStrategy"], "AsIs");
+        let explicit = generate_config(&user_server(), "global", "cloudflare", false, &[]).unwrap();
+        assert!(explicit.contains("1.1.1.1"));
+    }
+
+    #[test]
+    fn vless_uri_roundtrip_keeps_fragment() {
+        let uri = build_uri(&user_server()).unwrap();
+        assert!(
+            uri.contains("fragment=1%2C40-60%2C30-50%2Ctlshello"),
+            "{uri}"
+        );
+        let parsed = parse_vless(&uri).unwrap();
+        assert_eq!(parsed.fragment, "1,40-60,30-50,tlshello");
+        assert_eq!(parsed.ws_path, "/?ed=2560");
+    }
 }

@@ -25,6 +25,8 @@ interface Server {
   ws_path: string;
   ws_host: string;
   grpc_service_name: string;
+  /** TLS ClientHello fragmentation spec from the share link, e.g. "1,40-60,30-50,tlshello". */
+  fragment?: string;
   subId?: number;
 }
 
@@ -1557,6 +1559,13 @@ function App() {
                     <input type="checkbox" checked={!!ef.allow_insecure} onChange={(e) => setEf({ ...ef, allow_insecure: e.target.checked })} />
                     Allow insecure
                   </label>
+                  <div className="f-label">TLS Fragment</div>
+                  <input
+                    className="input"
+                    value={ef.fragment ?? ""}
+                    placeholder="1,40-60,30-50,tlshello"
+                    onChange={(e) => setEf({ ...ef, fragment: e.target.value })}
+                  />
                 </>
               )}
 
