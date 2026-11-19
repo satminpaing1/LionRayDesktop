@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.0";
+pub const APP_VERSION: &str = "1.8.1";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -27,6 +27,9 @@ struct LastConnect {
     ad_block: bool,
     bypass: Vec<String>,
     tun: bool,
+    udp: bool,
+    ipv6: bool,
+    fragment: bool,
 }
 static NETWORKS: Mutex<Option<sysinfo::Networks>> = Mutex::new(None);
 static DL_PROGRESS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -794,7 +797,16 @@ fn range_max(value: &str) -> u64 {
         .unwrap_or(0)
 }
 
-fn generate_config(server: &Server, routing: &str, dns: &str, ad_block: bool, bypass_domains: &[String]) -> Result<String, String> {
+fn generate_config(
+    server: &Server,
+    routing: &str,
+    dns: &str,
+    ad_block: bool,
+    bypass_domains: &[String],
+    udp: bool,
+    ipv6: bool,
+    fragment_on: bool,
+) -> Result<String, String> {
     let mut rules = vec![];
 
     // ad blocker rule
@@ -827,9 +839,19 @@ fn generate_config(server: &Server, routing: &str, dns: &str, ad_block: bool, by
         }
     }
 
+    // IPv6 disabled (default): reject IPv6 literals so apps don't waste seconds
+    // trying unreachable routes. Domain traffic is resolved remotely anyway.
+    if !ipv6 {
+        rules.push(json!({
+            "type": "field",
+            "ip": ["::/0"],
+            "outboundTag": "block"
+        }));
+    }
+
     rules.push(json!({
         "type": "field",
-        "network": "tcp,udp",
+        "network": if udp { "tcp,udp" } else { "tcp" },
         "outboundTag": "proxy"
     }));
 
@@ -852,21 +874,39 @@ fn generate_config(server: &Server, routing: &str, dns: &str, ad_block: bool, by
         "adguard" => Some(json!({ "servers": ["94.140.14.14", "94.140.15.15"] })),
         "custom" => Some(json!({ "servers": ["8.8.8.8"] })),
         _ => None,
-    };
+    }
+    .map(|mut section| {
+        section["queryStrategy"] = json!(if ipv6 { "UseIP" } else { "UseIPv4" });
+        section
+    });
 
     let routing_domain_strategy = if explicit_dns.is_some() { "IPIfNonMatch" } else { "AsIs" };
 
     // TLS ClientHello fragmentation requested by the share link: the proxy
     // outbound dials through a freedom outbound that fragments the handshake.
-    // Only meaningful when the transport is actually TLS.
+    // Only meaningful when the transport is actually TLS, and only when the
+    // user explicitly enabled it in Settings.
     let fragment = match server.security.as_str() {
-        "tls" | "reality" => parse_fragment_spec(&server.fragment),
+        "tls" | "reality" if fragment_on => parse_fragment_spec(&server.fragment),
         _ => None,
     };
     let mut proxy_stream = build_stream(server);
-    let mut outbounds = Vec::new();
+    // Low latency for interactive traffic; Nagle only adds delay here.
+    let mut sockopt = json!({ "tcpNoDelay": true });
+    if fragment.is_some() {
+        sockopt["dialerProxy"] = json!("fragment");
+    }
+    proxy_stream["sockopt"] = sockopt;
+
+    // `proxy` must stay first: Xray uses the first outbound as the default for
+    // traffic that matches no rule, and it must never fall through to freedom.
+    let mut outbounds = vec![json!({
+        "tag": "proxy",
+        "protocol": server.protocol,
+        "settings": build_outbound_settings(server)?,
+        "streamSettings": proxy_stream
+    })];
     if let Some(f) = fragment {
-        proxy_stream["sockopt"] = json!({ "dialerProxy": "fragment" });
         outbounds.push(json!({
             "tag": "fragment",
             "protocol": "freedom",
@@ -880,13 +920,16 @@ fn generate_config(server: &Server, routing: &str, dns: &str, ad_block: bool, by
             "streamSettings": { "sockopt": { "tcpNoDelay": true } }
         }));
     }
-    outbounds.push(json!({
-        "tag": "proxy",
-        "protocol": server.protocol,
-        "settings": build_outbound_settings(server)?,
-        "streamSettings": proxy_stream
-    }));
-    outbounds.push(json!({ "tag": "direct", "protocol": "freedom" }));
+    if ipv6 {
+        outbounds.push(json!({ "tag": "direct", "protocol": "freedom" }));
+    } else {
+        // Bypass/direct traffic must never dial IPv6 when IPv6 is disabled.
+        outbounds.push(json!({
+            "tag": "direct",
+            "protocol": "freedom",
+            "settings": { "domainStrategy": "UseIPv4" }
+        }));
+    }
     outbounds.push(json!({ "tag": "block", "protocol": "blackhole" }));
 
     let mut config = json!({
@@ -902,7 +945,7 @@ fn generate_config(server: &Server, routing: &str, dns: &str, ad_block: bool, by
                 "port": SOCKS_PORT,
                 "listen": "127.0.0.1",
                 "protocol": "socks",
-                "settings": { "udp": true, "auth": "noauth" }
+                "settings": { "udp": udp, "auth": "noauth" }
             },
             {
                 "tag": "http-in",
@@ -1043,7 +1086,7 @@ fn find_singbox_binary() -> Result<std::path::PathBuf, String> {
 // then hands every connection to the existing Xray SOCKS listener. Xray keeps
 // doing all protocol work, routing rules, ad blocking and stats, so TUN and
 // proxy mode behave identically from the app's point of view.
-fn generate_tun_config(dns: &str, interface_name: &str) -> String {
+fn generate_tun_config(dns: &str, interface_name: &str, udp: bool, ipv6: bool) -> String {
     // Resolve DNS through the tunnel with DoH so queries can never leak to the
     // local ISP resolver while the TUN adapter is default route.
     let (dns_ip, dns_name) = match dns {
@@ -1052,6 +1095,45 @@ fn generate_tun_config(dns: &str, interface_name: &str) -> String {
         "adguard" => ("94.140.14.14", "dns.adguard-dns.com"),
         _ => ("1.1.1.1", "cloudflare-dns.com"),
     };
+
+    let tun_addresses = if ipv6 {
+        vec!["172.19.0.1/30", "fdfe:dcba:9876::1/126"]
+    } else {
+        vec!["172.19.0.1/30"]
+    };
+    // Many Windows networks have no working IPv6. Returning AAAA records makes
+    // apps try unreachable routes through the TUN and hang, so IPv4-only is the
+    // default; the toggle allows IPv6 when the network actually supports it.
+    let dns_strategy = if ipv6 { "prefer_ipv4" } else { "ipv4_only" };
+    let dns_rules: Vec<Value> = if ipv6 {
+        Vec::new()
+    } else {
+        vec![json!({ "query_type": ["AAAA"], "action": "reject" })]
+    };
+    let self_cidr = if ipv6 {
+        vec!["172.19.0.0/30", "fdfe:dcba:9876::/126"]
+    } else {
+        vec!["172.19.0.0/30"]
+    };
+
+    let mut route_rules = vec![
+        // recover the hostname so Xray's domain rules (CN bypass, ad-block,
+        // bypass list) keep working for TUN traffic
+        json!({ "action": "sniff" }),
+        json!({ "port": 53, "action": "hijack-dns" }),
+    ];
+    if !udp {
+        // TCP-only mode: reject non-DNS UDP right away instead of stalling on
+        // a UDP relay the server may not support (QUIC would retry forever).
+        route_rules.push(json!({ "network": "udp", "action": "reject" }));
+    }
+    route_rules.extend([
+        json!({ "ip_cidr": self_cidr, "action": "reject" }),
+        // xray must reach the real server directly, never through TUN
+        json!({ "process_name": ["xray.exe", "sing-box.exe"], "action": "route", "outbound": "direct" }),
+        json!({ "ip_is_private": true, "action": "route", "outbound": "direct" }),
+        json!({ "action": "route", "outbound": "proxy" }),
+    ]);
 
     let config = json!({
         "log": { "level": "warn", "timestamp": true },
@@ -1066,22 +1148,14 @@ fn generate_tun_config(dns: &str, interface_name: &str) -> String {
                 "tls": { "server_name": dns_name }
             }],
             "final": "remote-dns",
-            // Many Windows networks have no working IPv6. Returning AAAA
-            // records makes apps try unreachable IPv6 routes through the TUN
-            // and hang; resolving IPv4-only keeps browsing fast everywhere.
-            "strategy": "ipv4_only",
-            // The DoH server still relays AAAA records it receives from the
-            // OS, so reject them at the DNS layer: Windows then uses the A
-            // record and never stalls on an unreachable IPv6 route.
-            "rules": [
-                { "query_type": ["AAAA"], "action": "reject" }
-            ]
+            "strategy": dns_strategy,
+            "rules": dns_rules
         },
         "inbounds": [{
             "type": "tun",
             "tag": "tun-in",
             "interface_name": interface_name,
-            "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
+            "address": tun_addresses,
             "mtu": 9000,
             "auto_route": true,
             "strict_route": true,
@@ -1104,17 +1178,7 @@ fn generate_tun_config(dns: &str, interface_name: &str) -> String {
             // never fall back to the system resolver (which points back into
             // this TUN) when a direct outbound has to resolve a domain
             "default_domain_resolver": "remote-dns",
-            "rules": [
-                // recover the hostname so Xray's domain rules (CN bypass,
-                // ad-block, bypass list) keep working for TUN traffic
-                { "action": "sniff" },
-                { "port": 53, "action": "hijack-dns" },
-                { "ip_cidr": ["172.19.0.0/30", "fdfe:dcba:9876::/126"], "action": "reject" },
-                // xray must reach the real server directly, never through TUN
-                { "process_name": ["xray.exe", "sing-box.exe"], "action": "route", "outbound": "direct" },
-                { "ip_is_private": true, "action": "route", "outbound": "direct" },
-                { "action": "route", "outbound": "proxy" }
-            ],
+            "rules": route_rules,
             "final": "proxy"
         }
     });
@@ -1169,10 +1233,10 @@ fn sweep_phantom_wintun() {
     let _ = cmd.output();
 }
 
-fn start_tun(dns: &str) -> Result<(), String> {
+fn start_tun(dns: &str, udp: bool, ipv6: bool) -> Result<(), String> {
     #[cfg(not(windows))]
     {
-        let _ = dns;
+        let _ = (dns, udp, ipv6);
         Err("TUN mode is only supported on Windows".into())
     }
     #[cfg(windows)]
@@ -1194,7 +1258,7 @@ fn start_tun(dns: &str) -> Result<(), String> {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         let interface_name = format!("LionRayTun{}{}", std::process::id() % 1000, seed % 100000);
-        std::fs::write(&config_path, generate_tun_config(dns, &interface_name))
+        std::fs::write(&config_path, generate_tun_config(dns, &interface_name, udp, ipv6))
             .map_err(|e| e.to_string())?;
 
         let mut cmd = std::process::Command::new(&path);
@@ -1487,6 +1551,9 @@ fn establish(
     ad_block: bool,
     bypass: &[String],
     tun: bool,
+    udp: bool,
+    ipv6: bool,
+    fragment_on: bool,
 ) -> Result<(), String> {
     // drop any previous core first so we never stack orphan processes
     stop_tun();
@@ -1507,7 +1574,7 @@ fn establish(
         dial_server.address = ip;
     }
 
-    let config = generate_config(&dial_server, routing, dns, ad_block, bypass)?;
+    let config = generate_config(&dial_server, routing, dns, ad_block, bypass, udp, ipv6, fragment_on)?;
 
     let config_dir = dirs::config_dir()
         .ok_or("no config dir")?
@@ -1570,7 +1637,7 @@ fn establish(
     }
 
     if tun {
-        if let Err(e) = start_tun(dns) {
+        if let Err(e) = start_tun(dns, udp, ipv6) {
             // roll back xray so a failed TUN start cannot leave a half state
             if let Ok(mut g) = CHILD.lock() {
                 if let Some(mut c) = g.take() {
@@ -1601,6 +1668,9 @@ async fn connect(
     ad_block: Option<bool>,
     bypass_domains: Option<Vec<String>>,
     tun: Option<bool>,
+    udp: Option<bool>,
+    ipv6: Option<bool>,
+    fragment: Option<bool>,
 ) -> Result<String, String> {
     if CONNECTED.load(Ordering::SeqCst) {
         return Err("Already connected — disconnect first".into());
@@ -1615,12 +1685,19 @@ async fn connect(
     let d = dns.clone().unwrap_or_else(|| "system".into());
     let ab = ad_block.unwrap_or(true);
     let bp = bypass_domains.clone().unwrap_or_default();
+    let udp_on = udp.unwrap_or(false);
+    let ipv6_on = ipv6.unwrap_or(false);
+    let fragment_on = fragment.unwrap_or(false);
 
     let srv = server.clone();
     let (r2, d2, bp2) = (r.clone(), d.clone(), bp.clone());
-    let started = tokio::task::spawn_blocking(move || establish(&srv, &r2, &d2, ab, &bp2, tun_on))
-        .await
-        .map_err(|e| format!("connect task failed: {e}"))?;
+    let started = tokio::task::spawn_blocking(move || {
+        establish(
+            &srv, &r2, &d2, ab, &bp2, tun_on, udp_on, ipv6_on, fragment_on,
+        )
+    })
+    .await
+    .map_err(|e| format!("connect task failed: {e}"))?;
 
     if let Err(e) = started {
         cleanup();
@@ -1635,6 +1712,9 @@ async fn connect(
         ad_block: ab,
         bypass: bp,
         tun: tun_on,
+        udp: udp_on,
+        ipv6: ipv6_on,
+        fragment: fragment_on,
     });
     Ok("Connected".into())
 }
@@ -2239,7 +2319,10 @@ pub fn run() {
                     }
                     retries += 1;
                     if let Some(l) = LAST.lock().ok().and_then(|g| g.clone()) {
-                        let _ = establish(&l.server, &l.routing, &l.dns, l.ad_block, &l.bypass, l.tun);
+                        let _ = establish(
+                            &l.server, &l.routing, &l.dns, l.ad_block, &l.bypass, l.tun, l.udp,
+                            l.ipv6, l.fragment,
+                        );
                     } else {
                         AUTO.store(false, Ordering::SeqCst);
                         CONNECTED.store(false, Ordering::SeqCst);
@@ -2296,51 +2379,110 @@ mod tests {
     #[test]
     fn config_routes_proxy_through_fragment_outbound() {
         let cfg: Value = serde_json::from_str(
-            &generate_config(&user_server(), "global", "system", false, &[]).unwrap(),
+            &generate_config(&user_server(), "global", "system", false, &[], false, false, true)
+                .unwrap(),
         )
         .unwrap();
         let outbounds = cfg["outbounds"].as_array().unwrap();
-        assert_eq!(outbounds[0]["tag"], "fragment");
-        assert_eq!(outbounds[0]["settings"]["fragment"]["packets"], "tlshello");
-        assert_eq!(outbounds[0]["settings"]["fragment"]["length"], "40-60");
-        assert_eq!(outbounds[0]["settings"]["fragment"]["interval"], "1-3");
+        // proxy must be first (Xray's default outbound), never freedom
+        assert_eq!(outbounds[0]["tag"], "proxy");
         assert_eq!(
-            outbounds[1]["streamSettings"]["sockopt"]["dialerProxy"],
+            outbounds[0]["streamSettings"]["sockopt"]["dialerProxy"],
             "fragment"
         );
+        assert_eq!(outbounds[1]["tag"], "fragment");
+        assert_eq!(outbounds[1]["settings"]["fragment"]["packets"], "tlshello");
+        assert_eq!(outbounds[1]["settings"]["fragment"]["length"], "40-60");
+        assert_eq!(outbounds[1]["settings"]["fragment"]["interval"], "1-3");
         // SNI and WS Host stay on the hostname
         assert_eq!(
-            outbounds[1]["streamSettings"]["tlsSettings"]["serverName"],
+            outbounds[0]["streamSettings"]["tlsSettings"]["serverName"],
             "smp.settminpaing.mm.am"
         );
         assert_eq!(
-            outbounds[1]["streamSettings"]["wsSettings"]["headers"]["Host"],
+            outbounds[0]["streamSettings"]["wsSettings"]["headers"]["Host"],
             "smp.settminpaing.mm.am"
         );
         assert_eq!(
-            outbounds[1]["streamSettings"]["wsSettings"]["path"],
+            outbounds[0]["streamSettings"]["wsSettings"]["path"],
             "/?ed=2560"
         );
     }
 
     #[test]
-    fn fragment_is_ignored_for_plaintext_transport() {
-        let mut s = user_server();
-        s.security = "none".into();
-        let cfg = generate_config(&s, "global", "system", false, &[]).unwrap();
+    fn fragment_is_ignored_when_disabled_or_plaintext() {
+        let s = user_server();
+        let cfg =
+            generate_config(&s, "global", "system", false, &[], false, false, false).unwrap();
+        assert!(!cfg.contains("\"fragment\""));
+        let mut plain = user_server();
+        plain.security = "none".into();
+        let cfg =
+            generate_config(&plain, "global", "system", false, &[], false, false, true).unwrap();
         assert!(!cfg.contains("\"fragment\""));
     }
 
     #[test]
-    fn system_dns_uses_os_resolver() {
+    fn system_dns_uses_os_resolver_and_defaults_are_tcp_ipv4() {
         let cfg: Value = serde_json::from_str(
-            &generate_config(&user_server(), "global", "system", false, &[]).unwrap(),
+            &generate_config(&user_server(), "global", "system", false, &[], false, false, false)
+                .unwrap(),
         )
         .unwrap();
         assert!(cfg.get("dns").is_none());
         assert_eq!(cfg["routing"]["domainStrategy"], "AsIs");
-        let explicit = generate_config(&user_server(), "global", "cloudflare", false, &[]).unwrap();
+        // UDP off by default
+        assert_eq!(cfg["inbounds"][0]["settings"]["udp"], false);
+        let final_rule = cfg["routing"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["outboundTag"] == "proxy")
+            .unwrap();
+        assert_eq!(final_rule["network"], "tcp");
+        // IPv6 off by default: IPv6 literals blocked, direct traffic is IPv4
+        assert!(cfg["routing"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["ip"][0] == "::/0" && r["outboundTag"] == "block"));
+        assert!(cfg["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o["tag"] == "direct" && o["settings"]["domainStrategy"] == "UseIPv4"));
+
+        let explicit = generate_config(
+            &user_server(), "global", "cloudflare", true, &[], true, true, false,
+        )
+        .unwrap();
         assert!(explicit.contains("1.1.1.1"));
+        assert!(explicit.contains("UseIP"));
+    }
+
+    #[test]
+    fn tun_defaults_to_tcp_and_ipv4() {
+        let cfg: Value =
+            serde_json::from_str(&generate_tun_config("system", "LionRayTunTest", false, false))
+                .unwrap();
+        assert_eq!(cfg["dns"]["strategy"], "ipv4_only");
+        assert_eq!(cfg["inbounds"][0]["address"].as_array().unwrap().len(), 1);
+        assert!(cfg["route"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["network"] == "udp" && r["action"] == "reject"));
+
+        let cfg6: Value =
+            serde_json::from_str(&generate_tun_config("system", "LionRayTunTest", true, true))
+                .unwrap();
+        assert_eq!(cfg6["dns"]["strategy"], "prefer_ipv4");
+        assert_eq!(cfg6["inbounds"][0]["address"].as_array().unwrap().len(), 2);
+        assert!(!cfg6["route"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["network"] == "udp"));
     }
 
     #[test]

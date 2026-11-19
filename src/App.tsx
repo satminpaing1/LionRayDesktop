@@ -54,6 +54,12 @@ interface Settings {
   autoConnect: boolean;
   subAutoUpdate: boolean;
   tunMode: boolean;
+  /** Allow UDP relay (QUIC/games). Off = TCP only. */
+  udp: boolean;
+  /** Allow IPv6. Off = IPv4 only. */
+  ipv6: boolean;
+  /** Apply the share link's TLS fragment value. Off by default. */
+  fragment: boolean;
 }
 
 const DEFAULT_SETTINGS: Settings = {
@@ -65,6 +71,9 @@ const DEFAULT_SETTINGS: Settings = {
   autoConnect: false,
   subAutoUpdate: false,
   tunMode: false,
+  udp: false,
+  ipv6: false,
+  fragment: false,
 };
 
 const IS_WINDOWS = typeof navigator !== "undefined" && /Windows/i.test(navigator.userAgent);
@@ -398,6 +407,9 @@ function App() {
           adBlock: settings.adBlock,
           bypassDomains: settings.bypassDomains,
           tun: settings.tunMode,
+          udp: settings.udp,
+          ipv6: settings.ipv6,
+          fragment: settings.fragment,
         });
         setConnected(true);
         if (!silent) showToast("Connected ✓");
@@ -407,7 +419,7 @@ function App() {
       }
       setBusy(false);
     },
-    [settings.routing, settings.dns, settings.adBlock, settings.bypassDomains, settings.tunMode, isAdmin, requestAdmin, showToast]
+    [settings.routing, settings.dns, settings.adBlock, settings.bypassDomains, settings.tunMode, settings.udp, settings.ipv6, settings.fragment, isAdmin, requestAdmin, showToast]
   );
 
   useEffect(() => {
@@ -1244,6 +1256,43 @@ function App() {
               </div>
             </div>
             <div className="hint">DNS changes apply on next connect.</div>
+
+            <div className="sec">Advanced</div>
+            <div className="card">
+              <div className="toggle-row">
+                <div>
+                  <div className="kv-t">🌐 IPv6</div>
+                  <div className="kv-s">Off = IPv4 only (recommended). Turn on if your network has working IPv6.</div>
+                </div>
+                <label className="switch">
+                  <input type="checkbox" checked={settings.ipv6} onChange={() => setSettings({ ...settings, ipv6: !settings.ipv6 })} />
+                  <span className="slider" />
+                </label>
+              </div>
+              <div className="hr" />
+              <div className="toggle-row">
+                <div>
+                  <div className="kv-t">✂️ TLS Fragment</div>
+                  <div className="kv-s">Use the link's fragment value. Turn on only if the server is blocked.</div>
+                </div>
+                <label className="switch">
+                  <input type="checkbox" checked={settings.fragment} onChange={() => setSettings({ ...settings, fragment: !settings.fragment })} />
+                  <span className="slider" />
+                </label>
+              </div>
+              <div className="hr" />
+              <div className="toggle-row">
+                <div>
+                  <div className="kv-t">📡 UDP Relay</div>
+                  <div className="kv-s">Off = TCP only (recommended). Turn on for QUIC/games.</div>
+                </div>
+                <label className="switch">
+                  <input type="checkbox" checked={settings.udp} onChange={() => setSettings({ ...settings, udp: !settings.udp })} />
+                  <span className="slider" />
+                </label>
+              </div>
+            </div>
+            <div className="hint">All advanced options are off by default. Changes apply on next connect.</div>
 
             <div className="sec">Domain Bypass</div>
             <div className="card">
