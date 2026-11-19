@@ -51,7 +51,21 @@ interface Settings {
   dark: boolean;
   autoConnect: boolean;
   subAutoUpdate: boolean;
+  tunMode: boolean;
 }
+
+const DEFAULT_SETTINGS: Settings = {
+  routing: "lan",
+  dns: "system",
+  adBlock: true,
+  bypassDomains: [],
+  dark: false,
+  autoConnect: false,
+  subAutoUpdate: false,
+  tunMode: false,
+};
+
+const IS_WINDOWS = typeof navigator !== "undefined" && /Windows/i.test(navigator.userAgent);
 
 type Tab = "home" | "servers" | "subs" | "settings";
 type SheetMode = null | "menu" | "sub";
@@ -176,8 +190,12 @@ function LiveStats() {
     let sysUp = -1;
     let smDown = 0;
     let smUp = 0;
+    let speedBusy = false;
     const A = 0.3; // EMA smoothing
     const sysPoll = setInterval(async () => {
+      // never queue overlapping invokes if a sample is slow (sleep/resume)
+      if (speedBusy) return;
+      speedBusy = true;
       try {
         const r = await invoke<{ down: number; up: number }>("get_net_speed");
         const now = Date.now();
@@ -193,14 +211,20 @@ function LiveStats() {
         sysUp = r.up;
         sysT = now;
       } catch { /* ignore */ }
+      finally { speedBusy = false; }
     }, 1000);
 
-    // xray session totals (for the "Total" row)
+    // xray session totals (for the "Total" row). This launch of xray.exe is
+    // expensive, so poll it slowly and never overlap calls.
+    let trafficBusy = false;
     const tpoll = setInterval(() => {
+      if (trafficBusy) return;
+      trafficBusy = true;
       invoke<{ down: number; up: number }>("get_traffic")
         .then((r) => setTotals({ down: r.down, up: r.up }))
-        .catch(() => {});
-    }, 2000);
+        .catch(() => {})
+        .finally(() => { trafficBusy = false; });
+    }, 5000);
 
     return () => {
       clearInterval(t);
@@ -238,17 +262,10 @@ function App() {
   const [servers, setServers] = useState<Server[]>([]);
   const [activeId, setActiveId] = useState<number | null>(null);
   const [subs, setSubs] = useState<Sub[]>([]);
-  const [settings, setSettings] = useState<Settings>({
-    routing: "lan",
-    dns: "system",
-    adBlock: true,
-    bypassDomains: [],
-    dark: false,
-    autoConnect: false,
-    subAutoUpdate: false,
-  });
+  const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const [connected, setConnected] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [isAdmin, setIsAdmin] = useState(false);
   const [selBusy, setSelBusy] = useState(false);
   const [toast, setToast] = useState<{ msg: string; bad?: boolean } | null>(null);
   const [sheet, setSheet] = useState<SheetMode>(null);
@@ -263,7 +280,6 @@ function App() {
   const [confirmDlg, setConfirmDlg] = useState<{ msg: string; onOk: () => void } | null>(null);
   const [bypassInput, setBypassInput] = useState("");
   const [appUpdate, setAppUpdate] = useState<string | null>(null);
-  const [lastSrv, setLastSrv] = useState<Server | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -299,17 +315,8 @@ function App() {
         );
         setActiveId(await loadStore<number | null>("lr_active", null));
         setSubs(await loadStore<Sub[]>("lr_subs", []));
-        setSettings(
-          await loadStore<Settings>("lr_settings", {
-            routing: "lan",
-            dns: "system",
-            adBlock: true,
-            bypassDomains: [],
-            dark: false,
-            autoConnect: false,
-            subAutoUpdate: false,
-          })
-        );
+        const savedSettings = await loadStore<Partial<Settings>>("lr_settings", {});
+        setSettings({ ...DEFAULT_SETTINGS, ...savedSettings });
       } catch {
         /* ignore */
       }
@@ -348,9 +355,38 @@ function App() {
     setTimeout(() => setToast(null), 2600);
   }, []);
 
+  // ─── restart with UAC so TUN mode can create its adapter ───
+  const requestAdmin = useCallback(() => {
+    setConfirmDlg({
+      msg:
+        "TUN mode captures every app on this PC, which requires administrator rights.\n\n" +
+        "LionRay will restart elevated. Any current connection will be closed. Continue?",
+      onOk: async () => {
+        setConfirmDlg(null);
+        try {
+          if (connected) {
+            manualDisconnectRef.current = true;
+            await invoke("disconnect").catch(() => {});
+            setConnected(false);
+            manualDisconnectRef.current = false;
+          }
+          await invoke("relaunch_as_admin");
+        } catch (e) {
+          showToast(String(e), true);
+        }
+      },
+    });
+  }, [connected, showToast]);
+
   // ─── init ───
   const doConnect = useCallback(
     async (srv: Server, silent = false) => {
+      // TUN needs an elevated process. Prompt once instead of failing with a
+      // raw error, and let auto-connect stay quiet until the user acts.
+      if (settings.tunMode && IS_WINDOWS && !isAdmin) {
+        if (!silent) requestAdmin();
+        return;
+      }
       setBusy(true);
       try {
         await invoke("connect", {
@@ -359,9 +395,9 @@ function App() {
           dns: settings.dns,
           adBlock: settings.adBlock,
           bypassDomains: settings.bypassDomains,
+          tun: settings.tunMode,
         });
         setConnected(true);
-        setLastSrv({ ...srv, id: 0, ping: null });
         if (!silent) showToast("Connected ✓");
         else showToast(`Auto-connected to ${srv.name}`);
       } catch (e) {
@@ -369,12 +405,13 @@ function App() {
       }
       setBusy(false);
     },
-    [settings.routing, settings.dns, settings.adBlock, settings.bypassDomains, showToast]
+    [settings.routing, settings.dns, settings.adBlock, settings.bypassDomains, settings.tunMode, isAdmin, requestAdmin, showToast]
   );
 
   useEffect(() => {
     invoke<boolean>("is_connected").then(setConnected).catch(() => {});
     invoke<string>("get_core_version").then(setCoreVer).catch(() => {});
+    invoke<boolean>("is_elevated").then(setIsAdmin).catch(() => {});
   }, []);
 
   const checkXrayUpdate = async () => {
@@ -449,58 +486,48 @@ function App() {
     };
   }, []);
 
-  // ─── exit-ip lookup (15s) + auto-reconnect heartbeat (5s) ───
+  // ─── exit-ip lookup (15s) while connected ───
   // NOTE: live per-second stats (elapsed / speeds / totals) live in the
   // <LiveStats> child so the whole App no longer re-renders every tick.
   useEffect(() => {
     if (!connected) return;
-    const check = () =>
+    let exitBusy = false;
+    const check = () => {
+      if (exitBusy) return;
+      exitBusy = true;
       invoke<ExitInfo>("check_exit_ip")
         .then((j) => setExitInfo(j))
-        .catch(() => {});
+        .catch(() => {})
+        .finally(() => { exitBusy = false; });
+    };
     const first = setTimeout(check, 1500);
     const poll = setInterval(check, 15000);
-
-    // heartbeat: check if xray is alive every 5s; auto-reconnect on drop
-    let wasDisconnected = false;
-    const heartbeat = setInterval(async () => {
-      try {
-        const alive = await invoke<boolean>("is_connected");
-        if (!alive && !wasDisconnected && !manualDisconnectRef.current) {
-          wasDisconnected = true;
-          setConnected(false);
-          showToast("Connection lost — reconnecting…", true);
-          // retry every 3s until network is back
-          const retry = async () => {
-            if (manualDisconnectRef.current) return;
-            const srv = lastSrv;
-            if (!srv) return;
-            try {
-              await invoke("connect", {
-                server: srv,
-                routing: settings.routing,
-                dns: settings.dns,
-                adBlock: settings.adBlock,
-                bypassDomains: settings.bypassDomains,
-              });
-              setConnected(true);
-              wasDisconnected = false;
-              showToast("Reconnected ✓");
-            } catch {
-              setTimeout(retry, 3000);
-            }
-          };
-          setTimeout(retry, 3000);
-        }
-      } catch { /* ignore */ }
-    }, 5000);
 
     return () => {
       clearTimeout(first);
       clearInterval(poll);
-      clearInterval(heartbeat);
     };
-  }, [connected, lastSrv, settings]);
+  }, [connected]);
+
+  // Background connection heartbeat. The Rust watchdog owns reconnection, so
+  // this only mirrors its state: calling connect() here as well would race the
+  // watchdog and could spawn two cores / two TUN adapters.
+  useEffect(() => {
+    let last: boolean | null = null;
+    const heartbeat = setInterval(async () => {
+      if (manualDisconnectRef.current) return;
+      try {
+        const alive = await invoke<boolean>("is_connected");
+        if (manualDisconnectRef.current) return;
+        if (last !== null && last !== alive) {
+          showToast(alive ? "Reconnected ✓" : "Connection lost — reconnecting…", !alive);
+        }
+        last = alive;
+        setConnected(alive);
+      } catch { /* backend busy; try again next tick */ }
+    }, 5000);
+    return () => clearInterval(heartbeat);
+  }, [showToast]);
 
   // ─── import helpers ───
   const appendServers = (list: Server[], subId?: number) => {
@@ -721,7 +748,6 @@ function App() {
         await invoke("disconnect");
         setConnected(false);
         setExitInfo(null);
-        setLastSrv(null);
         showToast("Disconnected");
       } catch (e) {
         showToast(String(e), true);
@@ -986,7 +1012,13 @@ function App() {
               {connected ? "CONNECTED" : "NOT CONNECTED"}
             </div>
             <div className="power-sub">
-              {connected ? "VPN tunnel active" : settings.autoConnect ? "Auto-connect enabled" : "Tap the button to connect"}
+              {connected
+                ? settings.tunMode
+                  ? "TUN active — all PC traffic"
+                  : "VPN tunnel active"
+                : settings.autoConnect
+                  ? "Auto-connect enabled"
+                  : "Tap the button to connect"}
             </div>
 
             {connected && <LiveStats />}
@@ -1140,6 +1172,44 @@ function App() {
             </div>
             <div className="hint">Applies on next connect. Ads blocked always.</div>
 
+            {IS_WINDOWS && (
+              <>
+                <div className="sec">Tunnel Mode</div>
+                <div className="card">
+                  <div className="toggle-row">
+                    <div>
+                      <div className="kv-t">🖥️ TUN Mode</div>
+                      <div className="kv-s">Capture every PC app, even ones that ignore the system proxy</div>
+                    </div>
+                    <label className="switch">
+                      <input
+                        type="checkbox"
+                        checked={settings.tunMode}
+                        onChange={() => setSettings({ ...settings, tunMode: !settings.tunMode })}
+                      />
+                      <span className="slider" />
+                    </label>
+                  </div>
+                  {settings.tunMode && !isAdmin && (
+                    <>
+                      <div className="hr" />
+                      <div className="tun-admin-row">
+                        <div className="kv-s">Administrator access is required to create the virtual adapter.</div>
+                        <button className="btn-secondary" onClick={requestAdmin}>🔐 Restart as Admin</button>
+                      </div>
+                    </>
+                  )}
+                </div>
+                <div className="hint">
+                  {settings.tunMode
+                    ? isAdmin
+                      ? "TUN is ready. The system proxy stays off while connected."
+                      : "Restart as administrator before connecting."
+                    : "Proxy mode (current): apps that ignore the Windows system proxy are not captured."}
+                </div>
+              </>
+            )}
+
             <div className="sec">Security</div>
             <div className="card">
               <div className="toggle-row">
@@ -1266,6 +1336,11 @@ function App() {
               <div className="kv"><span>Local SOCKS</span><b>127.0.0.1:10808</b></div>
               <div className="hr" />
               <div className="kv"><span>Local HTTP</span><b>127.0.0.1:10809</b></div>
+              <div className="hr" />
+              <div className="kv">
+                <span>Tunnel Mode</span>
+                <b>{settings.tunMode ? "TUN (system-wide)" : "System Proxy"}</b>
+              </div>
               <div className="hr" />
               <div className="kv">
                 <span>Xray Core</span>

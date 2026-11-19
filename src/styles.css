@@ -284,6 +284,10 @@ body {
 .kv-t { font-size: 14px; font-weight: 600; }
 .kv-s { font-size: 11.5px; color: var(--sub); margin-top: 1px; }
 
+/* TUN elevation prompt inside the settings card */
+.tun-admin-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 11px 0; }
+.tun-admin-row .btn-secondary { flex-shrink: 0; padding: 8px 10px; font-size: 11.5px; }
+
 .switch { position: relative; width: 44px; height: 24px; flex-shrink: 0; display: inline-block; }
 .switch input { opacity: 0; width: 0; height: 0; }
 .slider {

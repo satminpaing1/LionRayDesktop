@@ -10,6 +10,8 @@ const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
 
 static CHILD: Mutex<Option<std::process::Child>> = Mutex::new(None);
+// sing-box TUN front-end (Windows system-wide capture); None when TUN is off
+static TUN_CHILD: Mutex<Option<std::process::Child>> = Mutex::new(None);
 static CONNECTED: AtomicBool = AtomicBool::new(false);
 // user intent to stay connected — gates the auto-reconnect watchdog so a manual
 // disconnect is never "repaired" by an unwanted auto-reconnect
@@ -24,6 +26,7 @@ struct LastConnect {
     dns: String,
     ad_block: bool,
     bypass: Vec<String>,
+    tun: bool,
 }
 static NETWORKS: Mutex<Option<sysinfo::Networks>> = Mutex::new(None);
 static DL_PROGRESS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -90,6 +93,75 @@ fn set_keep_awake(on: bool) {
 
 #[cfg(not(windows))]
 fn set_keep_awake(_on: bool) {}
+
+// ───────────────────────── administrator detection ─────────────────────────
+// TUN mode creates a virtual adapter and rewrites the system routing table,
+// which Windows only permits for elevated processes. Raw FFI avoids adding a
+// windows-sys dependency just for two calls.
+#[cfg(windows)]
+mod win_elevation {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    struct TokenElevation {
+        token_is_elevated: u32,
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn OpenProcessToken(
+            process_handle: *mut c_void,
+            desired_access: u32,
+            token_handle: *mut *mut c_void,
+        ) -> i32;
+        fn GetTokenInformation(
+            token_handle: *mut c_void,
+            token_information_class: u32,
+            token_information: *mut c_void,
+            token_information_length: u32,
+            return_length: *mut u32,
+        ) -> i32;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> *mut c_void;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+
+    pub fn is_elevated() -> bool {
+        const TOKEN_QUERY: u32 = 0x0008;
+        const TOKEN_ELEVATION: u32 = 20;
+        unsafe {
+            let mut token: *mut c_void = std::ptr::null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                return false;
+            }
+            let mut elevation = TokenElevation { token_is_elevated: 0 };
+            let mut len: u32 = 0;
+            let ok = GetTokenInformation(
+                token,
+                TOKEN_ELEVATION,
+                &mut elevation as *mut _ as *mut c_void,
+                std::mem::size_of::<TokenElevation>() as u32,
+                &mut len,
+            );
+            CloseHandle(token);
+            ok != 0 && elevation.token_is_elevated != 0
+        }
+    }
+}
+
+fn running_as_admin() -> bool {
+    #[cfg(windows)]
+    {
+        win_elevation::is_elevated()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
 
 // True when the local SOCKS listener xray should be serving is actually up.
 fn socks_listening() -> bool {
@@ -726,24 +798,39 @@ fn generate_config(server: &Server, routing: &str, dns: &str, ad_block: bool, by
 
 fn find_xray_binary() -> Result<std::path::PathBuf, String> {
     let exe_name = if cfg!(target_os = "windows") { "xray.exe" } else { "xray" };
+    // Windows builds stage their core in xray-bundle-win; the shared
+    // xray-bundle folder keeps the macOS core. Search the native folder first
+    // so Windows never tries to launch the Mach-O binary.
+    let bundle_names: &[&str] = if cfg!(target_os = "windows") {
+        &["xray-bundle-win", "xray-bundle"]
+    } else {
+        &["xray-bundle", "xray-bundle-win"]
+    };
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
 
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("xray-bundle").join(exe_name));
-            candidates.push(dir.join("resources").join("xray-bundle").join(exe_name));
-            candidates.push(dir.join("Resources").join("xray-bundle").join(exe_name));
+            for b in bundle_names {
+                candidates.push(dir.join(b).join(exe_name));
+                candidates.push(dir.join("resources").join(b).join(exe_name));
+                candidates.push(dir.join("Resources").join(b).join(exe_name));
+            }
             // macOS .app bundle: exe is in Contents/MacOS, resources in
             // Contents/Resources — go up one level and into Resources.
             if let Some(parent) = dir.parent() {
-                candidates.push(parent.join("Resources").join("xray-bundle").join(exe_name));
-                candidates.push(parent.join("resources").join("xray-bundle").join(exe_name));
+                for b in bundle_names {
+                    candidates.push(parent.join("Resources").join(b).join(exe_name));
+                    candidates.push(parent.join("resources").join(b).join(exe_name));
+                }
             }
             candidates.push(dir.join(exe_name));
         }
     }
     if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
-        candidates.push(std::path::PathBuf::from(manifest).join("xray-bundle").join(exe_name));
+        let manifest = std::path::PathBuf::from(manifest);
+        for b in bundle_names {
+            candidates.push(manifest.join(b).join(exe_name));
+        }
     }
     candidates.push(std::path::PathBuf::from(exe_name));
 
@@ -764,6 +851,236 @@ fn find_xray_binary() -> Result<std::path::PathBuf, String> {
         }
     }
     Err("xray binary not found (looked next to app + xray-bundle)".into())
+}
+
+fn find_singbox_binary() -> Result<std::path::PathBuf, String> {
+    let exe_name = if cfg!(target_os = "windows") { "sing-box.exe" } else { "sing-box" };
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            // Windows builds stage their binaries in xray-bundle-win so the
+            // macOS bundle can keep its own xray binary. Accept both layouts.
+            for bundle in ["xray-bundle-win", "xray-bundle"] {
+                candidates.push(dir.join(bundle).join(exe_name));
+            }
+            candidates.push(dir.join("resources").join("xray-bundle-win").join(exe_name));
+            candidates.push(dir.join("resources").join("xray-bundle").join(exe_name));
+            candidates.push(dir.join("Resources").join("xray-bundle-win").join(exe_name));
+            candidates.push(dir.join("Resources").join("xray-bundle").join(exe_name));
+            if let Some(parent) = dir.parent() {
+                candidates.push(parent.join("Resources").join("xray-bundle-win").join(exe_name));
+                candidates.push(parent.join("Resources").join("xray-bundle").join(exe_name));
+                candidates.push(parent.join("resources").join("xray-bundle-win").join(exe_name));
+                candidates.push(parent.join("resources").join("xray-bundle").join(exe_name));
+            }
+            candidates.push(dir.join(exe_name));
+        }
+    }
+    if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
+        let manifest = std::path::PathBuf::from(manifest);
+        candidates.push(manifest.join("xray-bundle-win").join(exe_name));
+        candidates.push(manifest.join("xray-bundle").join(exe_name));
+    }
+    candidates.push(std::path::PathBuf::from(exe_name));
+
+    for c in &candidates {
+        if c.exists() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = std::fs::metadata(c) {
+                    let mode = meta.permissions().mode();
+                    if mode & 0o111 == 0 {
+                        let _ = std::fs::set_permissions(c, std::fs::Permissions::from_mode(mode | 0o755));
+                    }
+                }
+            }
+            return Ok(c.clone());
+        }
+    }
+    Err("sing-box binary not found — TUN mode needs sing-box.exe in xray-bundle-win".into())
+}
+
+// TUN front-end config: sing-box owns the virtual adapter + default routes,
+// then hands every connection to the existing Xray SOCKS listener. Xray keeps
+// doing all protocol work, routing rules, ad blocking and stats, so TUN and
+// proxy mode behave identically from the app's point of view.
+fn generate_tun_config(dns: &str, interface_name: &str) -> String {
+    // Resolve DNS through the tunnel with DoH so queries can never leak to the
+    // local ISP resolver while the TUN adapter is default route.
+    let (dns_ip, dns_name) = match dns {
+        "google" => ("8.8.8.8", "dns.google"),
+        "quad9" => ("9.9.9.9", "dns.quad9.net"),
+        "adguard" => ("94.140.14.14", "dns.adguard-dns.com"),
+        _ => ("1.1.1.1", "cloudflare-dns.com"),
+    };
+
+    let config = json!({
+        "log": { "level": "warn", "timestamp": true },
+        "dns": {
+            "servers": [{
+                "type": "https",
+                "tag": "remote-dns",
+                "server": dns_ip,
+                "server_port": 443,
+                "path": "/dns-query",
+                "detour": "proxy",
+                "tls": { "server_name": dns_name }
+            }],
+            "final": "remote-dns",
+            // Many Windows networks have no working IPv6. Returning AAAA
+            // records makes apps try unreachable IPv6 routes through the TUN
+            // and hang; resolving IPv4-only keeps browsing fast everywhere.
+            "strategy": "ipv4_only",
+            // The DoH server still relays AAAA records it receives from the
+            // OS, so reject them at the DNS layer: Windows then uses the A
+            // record and never stalls on an unreachable IPv6 route.
+            "rules": [
+                { "query_type": ["AAAA"], "action": "reject" }
+            ]
+        },
+        "inbounds": [{
+            "type": "tun",
+            "tag": "tun-in",
+            "interface_name": interface_name,
+            "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
+            "mtu": 9000,
+            "auto_route": true,
+            "strict_route": true,
+            "stack": "mixed",
+            "dns_mode": "hijack"
+        }],
+        "outbounds": [
+            {
+                "type": "socks",
+                "tag": "proxy",
+                "server": "127.0.0.1",
+                "server_port": SOCKS_PORT,
+                "version": "5",
+                "udp_over_tcp": false
+            },
+            { "type": "direct", "tag": "direct" }
+        ],
+        "route": {
+            "auto_detect_interface": true,
+            // never fall back to the system resolver (which points back into
+            // this TUN) when a direct outbound has to resolve a domain
+            "default_domain_resolver": "remote-dns",
+            "rules": [
+                // recover the hostname so Xray's domain rules (CN bypass,
+                // ad-block, bypass list) keep working for TUN traffic
+                { "action": "sniff" },
+                { "port": 53, "action": "hijack-dns" },
+                { "ip_cidr": ["172.19.0.0/30", "fdfe:dcba:9876::/126"], "action": "reject" },
+                // xray must reach the real server directly, never through TUN
+                { "process_name": ["xray.exe", "sing-box.exe"], "action": "route", "outbound": "direct" },
+                { "ip_is_private": true, "action": "route", "outbound": "direct" },
+                { "action": "route", "outbound": "proxy" }
+            ],
+            "final": "proxy"
+        }
+    });
+    serde_json::to_string_pretty(&config).unwrap_or_else(|_| "{}".into())
+}
+
+fn tun_alive() -> bool {
+    match TUN_CHILD.lock() {
+        Ok(mut g) => match g.as_mut() {
+            Some(c) => matches!(c.try_wait(), Ok(None)),
+            None => false,
+        },
+        Err(_) => false,
+    }
+}
+
+fn stop_tun() {
+    let had_child = if let Ok(mut guard) = TUN_CHILD.lock() {
+        if let Some(mut c) = guard.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    // A force-killed Wintun process only becomes a phantom device a moment
+    // later, so let a detached PowerShell finish the sweep even if the app is
+    // quitting. It is best-effort and never touches a live adapter.
+    #[cfg(windows)]
+    if had_child {
+        std::thread::spawn(sweep_phantom_wintun);
+    }
+    #[cfg(not(windows))]
+    let _ = had_child;
+}
+
+// A forcibly killed Wintun process leaves a hidden "phantom" device behind
+// (CM_PROB_PHANTOM). Reusing the same adapter name can then silently fail to
+// configure the interface, so every session gets a fresh name and this sweep
+// removes old sing-box phantoms in the background.
+#[cfg(windows)]
+fn sweep_phantom_wintun() {
+    // Wait for the killed process's PnP node to transition to CM_PROB_PHANTOM
+    // before removing it, otherwise the sweep runs too early and misses it.
+    let script = r#"Start-Sleep -Milliseconds 1500; Get-PnpDevice -Class Net -ErrorAction SilentlyContinue | Where-Object { $_.FriendlyName -like '*sing-tun*' -and $_.Problem -eq 'CM_PROB_PHANTOM' } | ForEach-Object { pnputil /remove-device $_.InstanceId | Out-Null }"#;
+    let mut cmd = std::process::Command::new("powershell.exe");
+    cmd.args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", script]);
+    hide_window(&mut cmd);
+    let _ = cmd.output();
+}
+
+fn start_tun(dns: &str) -> Result<(), String> {
+    #[cfg(not(windows))]
+    {
+        let _ = dns;
+        Err("TUN mode is only supported on Windows".into())
+    }
+    #[cfg(windows)]
+    {
+        if !running_as_admin() {
+            return Err("TUN mode needs administrator rights — restart LionRay as administrator".into());
+        }
+        let path = find_singbox_binary()?;
+        let config_dir = dirs::config_dir()
+            .ok_or("no config dir")?
+            .join("lionray-vpn");
+        std::fs::create_dir_all(&config_dir).map_err(|e| e.to_string())?;
+        let config_path = config_dir.join("singbox-tun.json");
+
+        // unique per session so a crashed/killed previous run can never leave
+        // a phantom adapter that blocks this one
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let interface_name = format!("LionRayTun{}{}", std::process::id() % 1000, seed % 100000);
+        std::fs::write(&config_path, generate_tun_config(dns, &interface_name))
+            .map_err(|e| e.to_string())?;
+
+        let mut cmd = std::process::Command::new(&path);
+        cmd.args(["run", "-c"]).arg(&config_path).current_dir(&config_dir);
+        cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        hide_window(&mut cmd);
+
+        let child = cmd.spawn().map_err(|e| format!("Failed to start TUN engine: {e}"))?;
+        *TUN_CHILD.lock().map_err(|e| e.to_string())? = Some(child);
+
+        // adapter creation + route programming takes a moment; fail fast if
+        // Windows refused (usually because the process is not elevated)
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        if !tun_alive() {
+            stop_tun();
+            return Err("TUN engine exited immediately — administrator rights are required".into());
+        }
+
+        // clean up devices left by earlier force-killed sessions (best effort,
+        // never blocks or fails an otherwise healthy connection)
+        std::thread::spawn(sweep_phantom_wintun);
+        Ok(())
+    }
 }
 
 fn set_system_proxy(on: bool) {
@@ -836,23 +1153,70 @@ fn set_system_proxy(on: bool) {
 }
 
 #[tauri::command]
-fn open_link(url: String) {
+async fn open_link(url: String) {
+    let _ = tokio::task::spawn_blocking(move || {
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            let _ = std::process::Command::new("cmd")
+                .args(["/c", "start", "", &url])
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("open").arg(&url).spawn();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+        }
+    })
+    .await;
+}
+
+#[tauri::command]
+fn is_elevated() -> bool {
+    running_as_admin()
+}
+
+// Relaunch this executable through UAC and hand over to the elevated instance.
+// The old process exits (RunEvent::Exit runs cleanup) so there is only ever
+// one LionRay/tunnel owner.
+#[tauri::command]
+async fn relaunch_as_admin(app: tauri::AppHandle) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        let _ = std::process::Command::new("cmd")
-            .args(["/c", "start", "", &url])
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn();
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        // PowerShell single-quoted strings escape ' by doubling it
+        let exe_str = exe.to_string_lossy().replace('\'', "''");
+        let script = format!(
+            "$ErrorActionPreference='Stop'; Start-Process -FilePath '{}' -Verb RunAs",
+            exe_str
+        );
+        tokio::task::spawn_blocking(move || {
+            let mut cmd = std::process::Command::new("powershell.exe");
+            cmd.args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script]);
+            hide_window(&mut cmd);
+            let status = cmd.status().map_err(|e| format!("elevation failed: {e}"))?;
+            if !status.success() {
+                return Err("Administrator request was cancelled".to_string());
+            }
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|e| format!("elevation task failed: {e}"))??;
+
+        // give the new process a moment to appear before we tear this one down
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        app.exit(0);
+        Ok(())
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "windows"))]
     {
-        let _ = std::process::Command::new("open").arg(&url).spawn();
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+        let _ = app;
+        Err("TUN mode is only supported on Windows".into())
     }
 }
 
@@ -865,8 +1229,10 @@ fn establish(
     dns: &str,
     ad_block: bool,
     bypass: &[String],
+    tun: bool,
 ) -> Result<(), String> {
     // drop any previous core first so we never stack orphan processes
+    stop_tun();
     if let Ok(mut g) = CHILD.lock() {
         if let Some(mut c) = g.take() {
             let _ = c.kill();
@@ -905,36 +1271,77 @@ fn establish(
     let child = cmd.spawn().map_err(|e| format!("Failed to start xray: {e}"))?;
     *CHILD.lock().map_err(|e| e.to_string())? = Some(child);
 
-    // give the core a moment to boot; kill+rollback if it died instantly (bad config etc.)
-    std::thread::sleep(std::time::Duration::from_millis(700));
-    let alive = {
-        let mut guard = CHILD.lock().map_err(|e| e.to_string())?;
-        match guard.as_mut() {
-            Some(c) => matches!(c.try_wait(), Ok(None)),
-            None => false,
+    // Wait until the SOCKS listener is actually accepting connections. A fixed
+    // sleep made the UI spin on slow machines and could race the first
+    // request; polling also detects a core that died from a bad config.
+    let mut ready = false;
+    for _ in 0..40 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let alive = {
+            let mut guard = CHILD.lock().map_err(|e| e.to_string())?;
+            match guard.as_mut() {
+                Some(c) => matches!(c.try_wait(), Ok(None)),
+                None => false,
+            }
+        };
+        if !alive {
+            break;
         }
-    };
-    if !alive {
-        *CHILD.lock().map_err(|e| e.to_string())? = None;
-        return Err("xray exited immediately — check server settings".into());
+        if socks_listening() {
+            ready = true;
+            break;
+        }
+    }
+    if !ready {
+        if let Ok(mut g) = CHILD.lock() {
+            if let Some(mut c) = g.take() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+        return Err("xray could not start - check server settings".into());
     }
 
-    set_system_proxy(true);
+    if tun {
+        if let Err(e) = start_tun(dns) {
+            // roll back xray so a failed TUN start cannot leave a half state
+            if let Ok(mut g) = CHILD.lock() {
+                if let Some(mut c) = g.take() {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+            }
+            CONNECTED.store(false, Ordering::SeqCst);
+            return Err(e);
+        }
+        // TUN captures everything; a system proxy on top would double-route
+        // traffic and can leak DNS, so make sure it is off.
+        set_system_proxy(false);
+    } else {
+        set_system_proxy(true);
+    }
+
     set_keep_awake(true);
     CONNECTED.store(true, Ordering::SeqCst);
     Ok(())
 }
 
 #[tauri::command]
-fn connect(
+async fn connect(
     server: Server,
     routing: Option<String>,
     dns: Option<String>,
     ad_block: Option<bool>,
     bypass_domains: Option<Vec<String>>,
+    tun: Option<bool>,
 ) -> Result<String, String> {
     if CONNECTED.load(Ordering::SeqCst) {
         return Err("Already connected — disconnect first".into());
+    }
+
+    let tun_on = tun.unwrap_or(false);
+    if tun_on && !running_as_admin() {
+        return Err("TUN mode needs administrator rights — restart LionRay as administrator".into());
     }
 
     let r = routing.clone().unwrap_or_else(|| "lan".into());
@@ -942,34 +1349,68 @@ fn connect(
     let ab = ad_block.unwrap_or(true);
     let bp = bypass_domains.clone().unwrap_or_default();
 
-    if let Err(e) = establish(&server, &r, &d, ab, &bp) {
+    let srv = server.clone();
+    let (r2, d2, bp2) = (r.clone(), d.clone(), bp.clone());
+    let started = tokio::task::spawn_blocking(move || establish(&srv, &r2, &d2, ab, &bp2, tun_on))
+        .await
+        .map_err(|e| format!("connect task failed: {e}"))?;
+
+    if let Err(e) = started {
         cleanup();
         return Err(e);
     }
 
     AUTO.store(true, Ordering::SeqCst);
     *LAST.lock().map_err(|e| e.to_string())? = Some(LastConnect {
-        server: server.clone(),
+        server,
         routing: r,
         dns: d,
         ad_block: ab,
         bypass: bp,
+        tun: tun_on,
     });
     Ok("Connected".into())
 }
 
 #[tauri::command]
-fn disconnect() -> Result<String, String> {
-    if !CONNECTED.load(Ordering::SeqCst) {
-        return Err("Not connected".into());
-    }
-    cleanup();
+async fn disconnect() -> Result<String, String> {
+    // Always run the full cleanup: even when CONNECTED is already false (the
+    // core died, or the frontend missed a heartbeat) the user's intent is to
+    // stop, so clear AUTO and any half-open TUN/proxy state too.
+    tokio::task::spawn_blocking(cleanup)
+        .await
+        .map_err(|e| format!("disconnect task failed: {e}"))?;
     Ok("Disconnected".into())
 }
 
 #[tauri::command]
 fn is_connected() -> bool {
-    CONNECTED.load(Ordering::SeqCst)
+    if !CONNECTED.load(Ordering::SeqCst) {
+        return false;
+    }
+    // Detect a crashed core immediately instead of waiting for the watchdog,
+    // so the UI's heartbeat can show "connection lost" and reconnect.
+    let core_alive = match CHILD.lock() {
+        Ok(mut g) => match g.as_mut() {
+            Some(c) => matches!(c.try_wait(), Ok(None)),
+            None => false,
+        },
+        Err(_) => false,
+    };
+    if !core_alive {
+        CONNECTED.store(false, Ordering::SeqCst);
+        return false;
+    }
+    let tun_on = LAST
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|l| l.tun))
+        .unwrap_or(false);
+    if tun_on && !tun_alive() {
+        CONNECTED.store(false, Ordering::SeqCst);
+        return false;
+    }
+    true
 }
 
 // ── lifecycle cleanup ──
@@ -978,6 +1419,9 @@ fn is_connected() -> bool {
 // hijacked / half-connected. Also clears the auto-reconnect intent and the
 // keep-awake request so a manual disconnect stays a manual disconnect.
 fn cleanup() {
+    // stop the TUN adapter first: it owns the default routes, so removing it
+    // before xray avoids a short window where traffic is sent to a dead proxy
+    stop_tun();
     if let Ok(mut guard) = CHILD.lock() {
         if let Some(mut c) = guard.take() {
             let _ = c.kill();
@@ -993,19 +1437,23 @@ fn cleanup() {
 
 
 #[tauri::command]
-fn ping_server(address: String, port: u16) -> Result<u64, String> {
-    use std::net::TcpStream;
-    use std::time::{Duration, Instant};
+async fn ping_server(address: String, port: u16) -> Result<u64, String> {
+    tokio::task::spawn_blocking(move || {
+        use std::net::TcpStream;
+        use std::time::{Duration, Instant};
 
-    let target = format!("{address}:{port}");
-    let addrs: Vec<std::net::SocketAddr> = std::net::ToSocketAddrs::to_socket_addrs(&target as &str)
-        .map_err(|e| format!("DNS fail: {e}"))?
-        .collect();
-    let first = addrs.first().ok_or("no address")?;
+        let target = format!("{address}:{port}");
+        let addrs: Vec<std::net::SocketAddr> = std::net::ToSocketAddrs::to_socket_addrs(&target as &str)
+            .map_err(|e| format!("DNS fail: {e}"))?
+            .collect();
+        let first = addrs.first().ok_or("no address")?;
 
-    let start = Instant::now();
-    TcpStream::connect_timeout(first, Duration::from_secs(2)).map_err(|e| e.to_string())?;
-    Ok(start.elapsed().as_millis() as u64)
+        let start = Instant::now();
+        TcpStream::connect_timeout(first, Duration::from_secs(2)).map_err(|e| e.to_string())?;
+        Ok(start.elapsed().as_millis() as u64)
+    })
+    .await
+    .map_err(|e| format!("ping task failed: {e}"))?
 }
 
 #[tauri::command]
@@ -1061,56 +1509,67 @@ async fn check_exit_ip() -> Result<Value, String> {
 }
 
 #[tauri::command]
-fn get_traffic() -> Result<Value, String> {
-    if !CONNECTED.load(Ordering::SeqCst) {
-        return Ok(json!({ "down": 0u64, "up": 0u64 }));
-    }
-    let path = find_xray_binary()?;
-    let mut cmd = std::process::Command::new(&path);
-    cmd.args([
-        "api",
-        "statsquery",
-        &format!("--server=127.0.0.1:{API_PORT}"),
-    ]);
-    hide_window(&mut cmd);
-    let out = cmd.output().map_err(|e| e.to_string())?;
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).to_string());
-    }
-    let v: Value = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
+async fn get_traffic() -> Result<Value, String> {
+    tokio::task::spawn_blocking(|| {
+        if !CONNECTED.load(Ordering::SeqCst) {
+            return Ok(json!({ "down": 0u64, "up": 0u64 }));
+        }
+        // This spawns xray.exe once per poll. It is deliberately kept off the
+        // UI thread; the frontend also polls it slowly (5s) so a 35 MB process
+        // start can never compete with clicks/animations.
+        let path = find_xray_binary()?;
+        let mut cmd = std::process::Command::new(&path);
+        cmd.args([
+            "api",
+            "statsquery",
+            &format!("--server=127.0.0.1:{API_PORT}"),
+        ]);
+        hide_window(&mut cmd);
+        let out = cmd.output().map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).to_string());
+        }
+        let v: Value = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
 
-    let mut down: u64 = 0;
-    let mut up: u64 = 0;
-    if let Some(stats) = v["stat"].as_array() {
-        for s in stats {
-            let name = s["name"].as_str().unwrap_or("");
-            let val = s["value"].as_u64().unwrap_or(0);
-            if name.contains(">>>api") {
-                continue;
-            }
-            if name.ends_with("downlink") {
-                down = down.saturating_add(val);
-            } else if name.ends_with("uplink") {
-                up = up.saturating_add(val);
+        let mut down: u64 = 0;
+        let mut up: u64 = 0;
+        if let Some(stats) = v["stat"].as_array() {
+            for s in stats {
+                let name = s["name"].as_str().unwrap_or("");
+                let val = s["value"].as_u64().unwrap_or(0);
+                if name.contains(">>>api") {
+                    continue;
+                }
+                if name.ends_with("downlink") {
+                    down = down.saturating_add(val);
+                } else if name.ends_with("uplink") {
+                    up = up.saturating_add(val);
+                }
             }
         }
-    }
-    Ok(json!({ "down": down, "up": up }))
+        Ok(json!({ "down": down, "up": up }))
+    })
+    .await
+    .map_err(|e| format!("traffic task failed: {e}"))?
 }
 
 #[tauri::command]
-fn get_net_speed() -> Result<Value, String> {
-    let mut guard = NETWORKS.lock().map_err(|e| e.to_string())?;
-    let nets = guard.get_or_insert_with(sysinfo::Networks::new_with_refreshed_list);
-    nets.refresh(true);
+async fn get_net_speed() -> Result<Value, String> {
+    tokio::task::spawn_blocking(|| {
+        let mut guard = NETWORKS.lock().map_err(|e| e.to_string())?;
+        let nets = guard.get_or_insert_with(sysinfo::Networks::new_with_refreshed_list);
+        nets.refresh(true);
 
-    let mut down: u64 = 0;
-    let mut up: u64 = 0;
-    for (_name, data) in nets.iter() {
-        down += data.received();
-        up += data.transmitted();
-    }
-    Ok(json!({ "down": down, "up": up }))
+        let mut down: u64 = 0;
+        let mut up: u64 = 0;
+        for (_name, data) in nets.iter() {
+            down += data.received();
+            up += data.transmitted();
+        }
+        Ok(json!({ "down": down, "up": up }))
+    })
+    .await
+    .map_err(|e| format!("net speed task failed: {e}"))?
 }
 
 #[tauri::command]
@@ -1122,27 +1581,55 @@ async fn check_xray_core_update() -> Result<Option<Value>, String> {
 
     // strip "v" prefix for comparison
     let remote_ver = tag.trim_start_matches('v').trim_start_matches('V').to_string();
-    let cur = get_core_version().unwrap_or_default();
+    let cur = tokio::task::spawn_blocking(get_core_version_sync)
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or_default();
     let cur_clean = cur.trim_start_matches('v').trim_start_matches('V').trim().to_string();
 
     // if same version, no update
     if remote_ver == cur_clean { return Ok(None); }
 
-    // pick the asset for the current platform (windows / macos / linux)
-    let platform_kw = if cfg!(target_os = "windows") {
-        "windows"
+    // Pick the exact asset for this platform/arch. A loose "contains 64"
+    // match can select Xray-windows-arm64-v8a.zip (or the 32-bit build) on
+    // an x86_64 PC and install a core that cannot run there.
+    let wanted: &[&str] = if cfg!(target_os = "windows") {
+        if cfg!(target_arch = "aarch64") {
+            &["Xray-windows-arm64-v8a.zip"]
+        } else {
+            &["Xray-windows-64.zip"]
+        }
     } else if cfg!(target_os = "macos") {
-        "macos"
+        if cfg!(target_arch = "aarch64") {
+            &["Xray-macos-arm64-v8a.zip"]
+        } else {
+            &["Xray-macos-64.zip"]
+        }
     } else {
-        "linux"
+        &["Xray-linux-64.zip"]
     };
     let mut zip_url: Option<String> = None;
     if let Some(assets) = v["assets"].as_array() {
         for a in assets {
             let name = a["name"].as_str().unwrap_or("");
-            if name.contains(platform_kw) && name.contains("64") && name.ends_with(".zip") {
+            if wanted.contains(&name) {
                 zip_url = a["browser_download_url"].as_str().map(|s| s.to_string());
                 break;
+            }
+        }
+        if zip_url.is_none() && cfg!(target_os = "windows") {
+            // fallback for future naming changes, but never the arm64/32 build
+            for a in assets {
+                let name = a["name"].as_str().unwrap_or("");
+                if name.starts_with("Xray-windows-")
+                    && name.ends_with(".zip")
+                    && !name.contains("arm")
+                    && !name.contains("32")
+                {
+                    zip_url = a["browser_download_url"].as_str().map(|s| s.to_string());
+                    break;
+                }
             }
         }
     }
@@ -1252,7 +1739,11 @@ async fn update_xray_core(url: String) -> Result<String, String> {
     .await
     .map_err(|e| format!("task: {e}"))??;
 
-    let new_ver = get_core_version().unwrap_or_else(|_| "unknown".into());
+    let new_ver = tokio::task::spawn_blocking(get_core_version_sync)
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or_else(|| "unknown".into());
     Ok(new_ver)
 }
 
@@ -1261,8 +1752,7 @@ fn get_download_progress() -> u32 {
     DL_PROGRESS.load(Ordering::Relaxed)
 }
 
-#[tauri::command]
-fn get_core_version() -> Result<String, String> {
+fn get_core_version_sync() -> Result<String, String> {
     let path = find_xray_binary()?;
     let bundle_dir = path.parent().unwrap_or(std::path::Path::new("."));
 
@@ -1289,6 +1779,14 @@ fn get_core_version() -> Result<String, String> {
         .unwrap_or("unknown")
         .to_string();
     Ok(ver)
+}
+
+#[tauri::command]
+async fn get_core_version() -> Result<String, String> {
+    // spawning the core just to read its version must not block the webview
+    tokio::task::spawn_blocking(get_core_version_sync)
+        .await
+        .map_err(|e| format!("version task failed: {e}"))?
 }
 
 // Real, stamped app version (overwritten by the build workflow via sed).
@@ -1345,37 +1843,45 @@ fn store_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
 }
 
 #[tauri::command]
-fn load_store(app: tauri::AppHandle, key: String) -> Result<Option<String>, String> {
+async fn load_store(app: tauri::AppHandle, key: String) -> Result<Option<String>, String> {
     let path = store_path(&app)?;
-    if !path.exists() {
-        return Ok(None);
-    }
-    let s = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let map: Value = serde_json::from_str(&s).unwrap_or(Value::Null);
-    Ok(map
-        .get(key.as_str())
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string()))
+    tokio::task::spawn_blocking(move || {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let s = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let map: Value = serde_json::from_str(&s).unwrap_or(Value::Null);
+        Ok(map
+            .get(key.as_str())
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()))
+    })
+    .await
+    .map_err(|e| format!("store read task failed: {e}"))?
 }
 
 #[tauri::command]
-fn save_store(app: tauri::AppHandle, key: String, value: String) -> Result<(), String> {
+async fn save_store(app: tauri::AppHandle, key: String, value: String) -> Result<(), String> {
     let path = store_path(&app)?;
-    let mut map: Value = if path.exists() {
-        let s = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        serde_json::from_str(&s).unwrap_or(Value::Null)
-    } else {
-        Value::Null
-    };
-    if !map.is_object() {
-        map = Value::Object(serde_json::Map::new());
-    }
-    map.as_object_mut()
-        .unwrap()
-        .insert(key, Value::String(value));
-    std::fs::write(&path, serde_json::to_string(&map).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    tokio::task::spawn_blocking(move || {
+        let mut map: Value = if path.exists() {
+            let s = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+            serde_json::from_str(&s).unwrap_or(Value::Null)
+        } else {
+            Value::Null
+        };
+        if !map.is_object() {
+            map = Value::Object(serde_json::Map::new());
+        }
+        map.as_object_mut()
+            .unwrap()
+            .insert(key, Value::String(value));
+        std::fs::write(&path, serde_json::to_string(&map).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("store write task failed: {e}"))?
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1405,6 +1911,8 @@ pub fn run() {
             get_download_progress,
             update_xray_core,
             open_link,
+            is_elevated,
+            relaunch_as_admin,
         ])
         .setup(|app| {
             // Attach a real icon to every window so the running process
@@ -1420,6 +1928,11 @@ pub fn run() {
                     let _ = win.set_icon(icon.clone());
                 }
             }
+
+            // Remove Wintun devices left behind by a previous force-killed
+            // sing-box before the user starts a new TUN session.
+            #[cfg(windows)]
+            std::thread::spawn(sweep_phantom_wintun);
 
             // Auto-reconnect watchdog: while the user intends to be connected
             // (AUTO), if the tunnel dies — xray crashed, a flaky subscription
@@ -1441,7 +1954,12 @@ pub fn run() {
                         },
                         Err(_) => false,
                     };
-                    let dead = !child_alive || !socks_listening();
+                    let tun_needed = LAST
+                        .lock()
+                        .ok()
+                        .and_then(|g| g.as_ref().map(|l| l.tun))
+                        .unwrap_or(false);
+                    let dead = !child_alive || !socks_listening() || (tun_needed && !tun_alive());
                     if !dead {
                         retries = 0;
                         continue;
@@ -1454,7 +1972,7 @@ pub fn run() {
                     }
                     retries += 1;
                     if let Some(l) = LAST.lock().ok().and_then(|g| g.clone()) {
-                        let _ = establish(&l.server, &l.routing, &l.dns, l.ad_block, &l.bypass);
+                        let _ = establish(&l.server, &l.routing, &l.dns, l.ad_block, &l.bypass, l.tun);
                     } else {
                         AUTO.store(false, Ordering::SeqCst);
                         CONNECTED.store(false, Ordering::SeqCst);

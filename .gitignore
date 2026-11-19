@@ -9,6 +9,13 @@ src-tauri/gen/schemas/
 # Bundled artifacts (local only)
 dist-output/
 
+# Windows cores are downloaded by the build workflow (or staged by hand);
+# they are ~150 MB and must not be committed. Keep README/version txt files.
+src-tauri/xray-bundle-win/*.exe
+src-tauri/xray-bundle-win/*.dat
+src-tauri/xray-bundle-win/version.txt
+src-tauri/xray-bundle-win/singbox-version.txt
+
 # Miscellaneous
 *.log
 .DS_Store

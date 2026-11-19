@@ -1,0 +1,269 @@
+name: Build Windows (NSIS installer)
+
+# One-shot Windows build:
+#   * manual run  -> needs app_version, optional core pins
+#   * tag push    -> app version comes from the tag (v1.6.0)
+# The job is deliberately deterministic: Xray and sing-box are pinned to
+# versions this app was validated against, every download is retried, the
+# build is retried, and the produced installer is verified before upload.
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_version:
+        description: 'App version to build & release (e.g. 1.6.0)'
+        required: true
+        type: string
+      xray_version:
+        description: 'Optional: pin Xray core tag (e.g. v26.3.27). Leave empty = v26.3.27 (validated)'
+        required: false
+        type: string
+        default: 'v26.3.27'
+      singbox_version:
+        description: 'Optional: pin sing-box tag (e.g. v1.14.4). Leave empty = v1.14.4'
+        required: false
+        type: string
+        default: 'v1.14.4'
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: windows-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    env:
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Rust toolchain (Windows x64)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend deps (retry)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $ok = $false
+          for ($i = 1; $i -le 3; $i++) {
+            npm ci --no-audit --no-fund
+            if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+            Write-Host "npm ci attempt $i failed (exit $LASTEXITCODE); retrying..."
+            Start-Sleep -Seconds (10 * $i)
+          }
+          if (-not $ok) { throw 'npm ci failed after 3 attempts' }
+
+      - name: Resolve versions
+        id: ver
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $app = "${{ github.event.inputs.app_version }}"
+          if ([string]::IsNullOrWhiteSpace($app) -and "${{ github.ref_type }}" -eq 'tag') {
+            $app = "${{ github.ref_name }}" -replace '^v', ''
+          }
+          if ([string]::IsNullOrWhiteSpace($app)) { $app = '1.6.0' }
+          if ($app -notmatch '^\d+\.\d+\.\d+([.-][0-9A-Za-z.-]+)?$') {
+            throw "invalid app version: '$app' (expected semver such as 1.6.0)"
+          }
+
+          # Pin the core versions the TUN config was validated against. A
+          # concrete pin removes the flaky api.github.com lookup and makes the
+          # release fully reproducible; it can still be overridden per run.
+          $xray = "${{ github.event.inputs.xray_version }}"
+          if ([string]::IsNullOrWhiteSpace($xray)) { $xray = 'v26.3.27' }
+          if ($xray -notmatch '^v') { $xray = "v$xray" }
+
+          $singbox = "${{ github.event.inputs.singbox_version }}"
+          if ([string]::IsNullOrWhiteSpace($singbox)) { $singbox = 'v1.14.4' }
+          if ($singbox -notmatch '^v') { $singbox = "v$singbox" }
+
+          "app=$app" >> $env:GITHUB_OUTPUT
+          "xray=$($xray -replace '^v','')" >> $env:GITHUB_OUTPUT
+          "xray_tag=$xray" >> $env:GITHUB_OUTPUT
+          "singbox=$($singbox -replace '^v','')" >> $env:GITHUB_OUTPUT
+          "singbox_tag=$singbox" >> $env:GITHUB_OUTPUT
+          Write-Host "App $app / Xray $xray / sing-box $singbox"
+
+      - name: Set app version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $app = "${{ steps.ver.outputs.app }}"
+
+          $text = Get-Content 'src-tauri/tauri.conf.json' -Raw
+          $text = ([regex]'("version"\s*:\s*")[^"]*(")').Replace($text, ('${1}' + $app + '${2}'), 1)
+          Set-Content -LiteralPath 'src-tauri/tauri.conf.json' -Value $text -NoNewline
+
+          $cargo = Get-Content 'src-tauri/Cargo.toml' -Raw
+          $cargo = ([regex]'(?m)^version\s*=\s*"[^"]*"').Replace($cargo, ('version = "' + $app + '"'), 1)
+          Set-Content -LiteralPath 'src-tauri/Cargo.toml' -Value $cargo -NoNewline
+
+          $lib = Get-Content 'src-tauri/src/lib.rs' -Raw
+          $lib = ([regex]'pub const APP_VERSION: &str = "[^"]*";').Replace($lib, ('pub const APP_VERSION: &str = "' + $app + '";'))
+          Set-Content -LiteralPath 'src-tauri/src/lib.rs' -Value $lib -NoNewline
+
+          # package.json + package-lock.json in one step
+          npm version $app --no-git-tag-version --allow-same-version --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { throw 'npm version failed' }
+
+          Select-String -Path 'src-tauri/tauri.conf.json','package.json' -Pattern '"version"'
+          Select-String -Path 'src-tauri/Cargo.toml' -Pattern '^version'
+          Select-String -Path 'src-tauri/src/lib.rs' -Pattern 'APP_VERSION: &str'
+
+      - name: Stage Xray core (Windows x64)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag  = "${{ steps.ver.outputs.xray_tag }}"
+          $zip  = Join-Path $env:RUNNER_TEMP 'xray.zip'
+          $dir  = Join-Path $env:RUNNER_TEMP 'xray'
+          $url  = "https://github.com/XTLS/Xray-core/releases/download/$tag/Xray-windows-64.zip"
+
+          if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }
+          $downloaded = $false
+          for ($i = 1; $i -le 5; $i++) {
+            & curl.exe -fL --retry 4 --retry-all-errors --retry-delay 3 --connect-timeout 20 -o $zip $url
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $zip) -and (Get-Item $zip).Length -gt 5MB) {
+              $downloaded = $true; break
+            }
+            Write-Host "Xray download attempt $i failed; retrying..."
+            Start-Sleep -Seconds (5 * $i)
+          }
+          if (-not $downloaded) { throw "could not download $url" }
+
+          Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force
+          $bundle = 'src-tauri/xray-bundle-win'
+          New-Item -ItemType Directory -Force -Path $bundle | Out-Null
+          foreach ($name in @('xray.exe', 'geoip.dat', 'geosite.dat')) {
+            $src = Join-Path $dir $name
+            if (-not (Test-Path $src)) { throw "Xray archive is missing $name" }
+            Copy-Item -LiteralPath $src -Destination (Join-Path $bundle $name) -Force
+          }
+          Set-Content -LiteralPath (Join-Path $bundle 'version.txt') -Value "${{ steps.ver.outputs.xray }}" -NoNewline
+          & (Join-Path $bundle 'xray.exe') version
+          if ($LASTEXITCODE -ne 0) { throw 'staged xray.exe does not run' }
+
+      - name: Stage sing-box TUN front-end (Windows x64)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = "${{ steps.ver.outputs.singbox_tag }}"
+          $ver = "${{ steps.ver.outputs.singbox }}"
+          $zip = Join-Path $env:RUNNER_TEMP 'singbox.zip'
+          $dir = Join-Path $env:RUNNER_TEMP 'singbox'
+          $url = "https://github.com/SagerNet/sing-box/releases/download/$tag/sing-box-$ver-windows-amd64.zip"
+
+          if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }
+          $downloaded = $false
+          for ($i = 1; $i -le 5; $i++) {
+            & curl.exe -fL --retry 4 --retry-all-errors --retry-delay 3 --connect-timeout 20 -o $zip $url
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $zip) -and (Get-Item $zip).Length -gt 5MB) {
+              $downloaded = $true; break
+            }
+            Write-Host "sing-box download attempt $i failed; retrying..."
+            Start-Sleep -Seconds (5 * $i)
+          }
+          if (-not $downloaded) { throw "could not download $url" }
+
+          Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force
+          $exe = Get-ChildItem -LiteralPath $dir -Recurse -Filter 'sing-box.exe' | Select-Object -First 1
+          if (-not $exe) { throw 'sing-box.exe not found in the archive' }
+          $bundle = 'src-tauri/xray-bundle-win'
+          Copy-Item -LiteralPath $exe.FullName -Destination (Join-Path $bundle 'sing-box.exe') -Force
+          Set-Content -LiteralPath (Join-Path $bundle 'singbox-version.txt') -Value $ver -NoNewline
+          & (Join-Path $bundle 'sing-box.exe') version
+          if ($LASTEXITCODE -ne 0) { throw 'staged sing-box.exe does not run' }
+
+      - name: Show staged core files
+        shell: pwsh
+        run: Get-ChildItem 'src-tauri/xray-bundle-win' | Select-Object Name, Length | Format-Table -AutoSize
+
+      - name: Build Tauri app (Windows NSIS, retry)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $ok = $false
+          for ($i = 1; $i -le 3; $i++) {
+            Write-Host "Tauri build attempt $i..."
+            npm run tauri build
+            if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+            Write-Host "Tauri build attempt $i failed; retrying (cargo cache stays warm)..."
+            Start-Sleep -Seconds (15 * $i)
+          }
+          if (-not $ok) { throw 'tauri build failed after 3 attempts' }
+        env:
+          CI: true
+
+      - name: Verify installer contents
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $bundle = 'src-tauri/xray-bundle-win'
+          foreach ($f in @('xray.exe', 'sing-box.exe', 'geoip.dat', 'geosite.dat')) {
+            $p = Join-Path $bundle $f
+            if (-not (Test-Path $p)) { throw "missing bundled core file: $f" }
+            if ((Get-Item $p).Length -lt 100000) { throw "bundled core file is too small: $f" }
+          }
+
+          $nsi = 'src-tauri/target/release/nsis/x64/installer.nsi'
+          if (-not (Test-Path $nsi)) { throw 'installer.nsi was not generated' }
+          $text = Get-Content $nsi -Raw
+          foreach ($needle in @('xray-bundle-win\xray.exe', 'xray-bundle-win\sing-box.exe', 'xray-bundle-win\geoip.dat', 'xray-bundle-win\geosite.dat')) {
+            if ($text -notmatch [regex]::Escape($needle)) { throw "installer is missing $needle" }
+          }
+
+          $inst = Get-ChildItem 'src-tauri/target/release/bundle/nsis/*.exe' -ErrorAction SilentlyContinue |
+                  Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $inst) { throw 'no NSIS installer was produced' }
+          if ($inst.Length -lt 20MB) { throw "installer is suspiciously small: $($inst.Length) bytes" }
+
+          "Installer OK: $($inst.FullName) ($([math]::Round($inst.Length / 1MB, 1)) MB)"
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lionray-windows-${{ steps.ver.outputs.app }}
+          path: src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.app }}
+          name: "LionRay VPN Desktop v${{ steps.ver.outputs.app }} (Windows x64)"
+          body: |
+            Windows x64 installer (NSIS).
+
+            - Xray core: ${{ steps.ver.outputs.xray }}
+            - TUN front-end: sing-box ${{ steps.ver.outputs.singbox }}
+            - TUN mode requires administrator rights and captures all PC traffic
+              without the Windows system proxy.
+            - System proxy is turned off automatically while TUN is active and
+              restored/cleaned up on disconnect or app exit.
+
+            > Unsigned build - Windows SmartScreen may show a warning. Choose
+            > "More info" > "Run anyway", or verify the file hash.
+          files: src-tauri/target/release/bundle/nsis/*.exe
+          fail_on_unmatched_files: true
+          overwrite_files: true
