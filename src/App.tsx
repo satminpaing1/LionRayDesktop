@@ -284,7 +284,8 @@ function App() {
   const [qrOpen, setQrOpen] = useState(false);
   const [exitInfo, setExitInfo] = useState<ExitInfo | null>(null);
   const [coreVer, setCoreVer] = useState("...");
-  const [xrayUpdate, setXrayUpdate] = useState<{ version: string; url: string } | null>(null);
+  // xray core updates are intentionally disabled (see backend PINNED_XRAY_VERSION)
+  const xrayUpdate: { version: string; url: string } | null = null;
   const [xrayUpdating, setXrayUpdating] = useState(false);
   const [xrayProgress, setXrayProgress] = useState(0);
   const [xrayCheckMsg, setXrayCheckMsg] = useState("");
@@ -428,26 +429,7 @@ function App() {
     invoke<boolean>("is_elevated").then(setIsAdmin).catch(() => {});
   }, []);
 
-  const checkXrayUpdate = async () => {
-    setXrayCheckMsg("Checking…");
-    try {
-      const r = await invoke<{ version: string; url: string } | null>("check_xray_core_update");
-      if (r) {
-        setXrayUpdate(r);
-        setXrayCheckMsg(`v${r.version} available`);
-      } else {
-        setXrayUpdate(null);
-        setXrayCheckMsg("Xray core is up to date ✓");
-      }
-    } catch (e: any) {
-      const msg = typeof e === "string" ? e : e?.message || "Check failed";
-      setXrayCheckMsg(`Error: ${msg.slice(0, 100)}`);
-    }
-    // also surface any available APP update (shown as a global banner)
-    invoke<string | null>("check_update")
-      .then((t) => { if (t) setAppUpdate(t); })
-      .catch(() => {});
-  };
+  const checkXrayUpdate = async () => {};
 
   useEffect(() => {
     // subscription auto-update on launch
@@ -470,9 +452,6 @@ function App() {
       invoke<string | null>("check_update")
         .then((t) => { if (t) setAppUpdate(t); })
         .catch(() => {});
-      if (!xrayUpdate && !xrayUpdating) {
-        checkXrayUpdate();
-      }
     }
   }, [tab]);
 
@@ -930,36 +909,8 @@ function App() {
       .catch((e) => showToast(String(e), true));
   };
 
-  const doXrayUpdate = async (url: string) => {
-    setConfirmDlg({
-      msg: "Download & replace xray core?\nApp will need restart after.",
-      onOk: async () => {
-        setConfirmDlg(null);
-        setXrayUpdating(true);
-        setXrayProgress(0);
-        // poll progress every 300ms
-        const poll = setInterval(async () => {
-          try {
-            const p = await invoke<number>("get_download_progress");
-            if (p > 0) setXrayProgress(p);
-          } catch {}
-        }, 300);
-        try {
-          const newVer = await invoke<string>("update_xray_core", { url });
-          setCoreVer(newVer);
-          setXrayUpdate(null);
-          setXrayCheckMsg(`Updated to v${newVer} ✓`);
-          showToast(`Xray core → ${newVer} ✓  Restart app to use.`);
-        } catch (e: any) {
-          const msg = typeof e === "string" ? e : e?.message || "Update failed";
-          showToast(msg.slice(0, 120), true);
-        } finally {
-          clearInterval(poll);
-          setXrayUpdating(false);
-          setXrayProgress(0);
-        }
-      },
-    });
+  const doXrayUpdate = async (_url: string) => {
+    showToast("Core updates are disabled in this build.", true);
   };
 
   const RoutingIcon = () => (
@@ -1397,52 +1348,26 @@ function App() {
                 <span>Xray Core</span>
                 <b style={{ display: "flex", alignItems: "center", gap: 6 }}>
                   v{coreVer}
-                  {xrayUpdate && <span className="update-dot" title={`Update to ${xrayUpdate.version}`} />}
+                  {false && <span className="update-dot" title={`Update to 0`} />}
                 </b>
               </div>
               <div className="hr" />
               <div className="kv"><span>App Version</span><b>{appVer}</b></div>
             </div>
 
-            <div className="sec">Xray Core Update</div>
+            <div className="sec">Xray Core</div>
             <div className="card update-card">
-              {xrayUpdating ? (
-                <div className="update-progress-wrap">
-                  <div className="update-progress-bar">
-                    <div className="update-progress-fill" style={{ width: `${xrayProgress}%` }} />
-                  </div>
-                  <div className="update-progress-text">Downloading… {xrayProgress}%</div>
-                </div>
-              ) : xrayUpdate ? (
-                <>
-                  <div className="kv">
-                    <span>New version available</span>
-                    <b style={{ color: "var(--green)" }}>v{xrayUpdate.version}</b>
-                  </div>
-                  <div className="hr" />
-                  <div className="update-btn-row">
-                    <button className="btn-primary m0" onClick={() => doXrayUpdate(xrayUpdate.url)}>
-                      ⬇ Update Now
-                    </button>
-                    <button className="btn-secondary" onClick={checkXrayUpdate}>↻</button>
-                  </div>
-                </>
-              ) : (
-                <>
-                  {xrayCheckMsg && (
-                    <div className="kv">
-                      <span style={{ color: xrayCheckMsg.startsWith("Error") ? "var(--red)" : "var(--sub)" }}>{xrayCheckMsg}</span>
-                    </div>
-                  )}
-                  <button
-                    className="btn-primary m0"
-                    style={{ marginTop: xrayCheckMsg ? 0 : 12 }}
-                    onClick={checkXrayUpdate}
-                  >
-                    🔍 Check for Updates
-                  </button>
-                </>
-              )}
+              <div className="kv">
+                <span>Core version</span>
+                <b>v{coreVer}</b>
+              </div>
+              <div className="hr" />
+              <div className="hint">
+                The core is pinned to the tested build for stability — automatic
+                updates are disabled. If you updated the core manually and see
+                slowness or TUN issues, reinstall the app to restore the
+                bundled core (v26.3.27).
+              </div>
             </div>
 
             <div className="sec">Community</div>
@@ -1715,7 +1640,7 @@ function App() {
         ] as const).map(([id, icon, label]) => (
           <button key={id} className={`nav-btn ${tab === id ? "active" : ""}`} onClick={() => setTab(id)}>
             <span className="nav-ico">{icon}</span>
-            {id === "settings" && xrayUpdate && <span className="nav-dot" />}
+            {id === "settings" && false && <span className="nav-dot" />}
             <span>{label}</span>
           </button>
         ))}

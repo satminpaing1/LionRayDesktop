@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.1";
+pub const APP_VERSION: &str = "1.8.2";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -1195,6 +1195,20 @@ fn tun_alive() -> bool {
     }
 }
 
+#[cfg(target_os = "windows")]
+const TUN_ROOT_KEY: &str = r"HKLM\SYSTEM\CurrentControlSet\Control\Network\sing-box_tun";
+
+#[cfg(target_os = "windows")]
+fn restore_singbox_tun_state() {
+    let mut cmd = std::process::Command::new("reg");
+    cmd.args(["delete", TUN_ROOT_KEY, "/f"]);
+    hide_window(&mut cmd);
+    let _ = cmd.output();
+}
+
+#[cfg(not(target_os = "windows"))]
+fn restore_singbox_tun_state() {}
+
 fn stop_tun() {
     let had_child = if let Ok(mut guard) = TUN_CHILD.lock() {
         if let Some(mut c) = guard.take() {
@@ -1207,9 +1221,15 @@ fn stop_tun() {
     } else {
         false
     };
-    // A force-killed Wintun process only becomes a phantom device a moment
-    // later, so let a detached PowerShell finish the sweep even if the app is
-    // quitting. It is best-effort and never touches a live adapter.
+    // Undo the host route that keeps the core outside the tunnel (see
+    // tunnel_host_route). Without this, a stale /32 for a dead server would
+    // shadow the next session.
+    clear_tunnel_host_route();
+    // sing-box's default auto_route keeps its routing state in the registry
+    // ("sing-box_tun") and recreates the adapter at boot. If the engine was
+    // killed, that leftover state can blackhole traffic; remove it while the
+    // tunnel is being torn down. The engine re-creates it on the next start.
+    restore_singbox_tun_state();
     #[cfg(windows)]
     if had_child {
         std::thread::spawn(sweep_phantom_wintun);
@@ -1217,6 +1237,85 @@ fn stop_tun() {
     #[cfg(not(windows))]
     let _ = had_child;
 }
+
+// When TUN is on, sing-box owns 0.0.0.0/0. Xray still has to dial the real
+// server, so we add a host route for the server IP through the physical
+// gateway (192.168.x.1 etc.). Without it the server address itself is routed
+// into the tunnel and Xray never reaches the server: every request times out
+// and it looks like "connected but no internet".
+//
+// The route is written to a small helper file (IP + gateway + interface) so
+// stop_tun can remove it even after the process restarts.
+#[cfg(target_os = "windows")]
+fn tunnel_host_route(server_ip: &str) {
+    // only valid for a real IPv4 literal; domains are pre-resolved to IPs
+    if server_ip.parse::<std::net::Ipv4Addr>().is_err() {
+        return;
+    }
+    clear_tunnel_host_route();
+    // find the physical default route (the one that is NOT the tun adapter)
+    let out = std::process::Command::new("netsh")
+        .args(["interface", "ipv4", "show", "route"])
+        .output();
+    let Ok(out) = out else { return };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut gw = String::new();
+    let mut iface = String::new();
+    for line in text.lines() {
+        // "  0.0.0.0/0     192.168.31.1   Wi-Fi   2"
+        if !line.contains("0.0.0.0/0") {
+            continue;
+        }
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() >= 4 {
+            // gateway is after the prefix, interface name is the 3rd column
+            let g = cols[1];
+            if !g.starts_with("10.") && !g.starts_with("192.168") && !g.starts_with("172.") {
+                continue;
+            }
+            gw = g.to_string();
+            iface = cols[2].to_string();
+            break;
+        }
+    }
+    if gw.is_empty() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(tunnel_route_file().parent().unwrap());
+    let _ = std::fs::write(
+        tunnel_route_file(),
+        format!("{server_ip}\n{gw}\n{iface}\n"),
+    );
+    let _ = std::process::Command::new("route")
+        .args(["add", server_ip, "mask", "255.255.255.255", &gw, "metric", "1"])
+        .output();
+}
+
+fn tunnel_route_file() -> std::path::PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("lionray-vpn")
+        .join("tun-route.txt")
+}
+
+fn clear_tunnel_host_route() {
+    let Ok(content) = std::fs::read_to_string(tunnel_route_file()) else {
+        return;
+    };
+    let mut lines = content.lines();
+    if let Some(ip) = lines.next() {
+        let _ = std::process::Command::new("route")
+            .args(["delete", ip])
+            .output();
+    }
+    let _ = std::fs::remove_file(tunnel_route_file());
+}
+
+#[cfg(not(target_os = "windows"))]
+fn tunnel_host_route(_server_ip: &str) {}
+
+#[cfg(not(target_os = "windows"))]
+fn clear_tunnel_host_route() {}
 
 // A forcibly killed Wintun process leaves a hidden "phantom" device behind
 // (CM_PROB_PHANTOM). Reusing the same adapter name can then silently fail to
@@ -1352,6 +1451,41 @@ fn set_system_proxy(on: bool) {
         }
     }
 }
+
+// A crash, an installer upgrade, or a force-killed core can leave the Windows
+// system proxy pointing at our local port after xray is already gone. Every
+// browser then behaves as if the machine is offline. Only clear the value when
+// it is ours and nothing is listening, so a second running instance that is
+// actually connected is never disturbed.
+#[cfg(target_os = "windows")]
+fn restore_stale_proxy() {
+    if socks_listening() {
+        return;
+    }
+    let mut cmd = std::process::Command::new("reg");
+    cmd.args([
+        "query",
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+        "/v",
+        "ProxyServer",
+    ]);
+    hide_window(&mut cmd);
+    let ours = cmd
+        .output()
+        .ok()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .to_ascii_lowercase()
+                .contains(&format!("127.0.0.1:{HTTP_PORT}"))
+        })
+        .unwrap_or(false);
+    if ours {
+        set_system_proxy(false);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn restore_stale_proxy() {}
 
 #[tauri::command]
 async fn open_link(url: String) {
@@ -1648,10 +1782,14 @@ fn establish(
             CONNECTED.store(false, Ordering::SeqCst);
             return Err(e);
         }
+        // keep the proxy server reachable outside the tunnel: Xray must dial
+        // the real IP directly, not through the TUN adapter sing-box owns
+        tunnel_host_route(&dial_server.address);
         // TUN captures everything; a system proxy on top would double-route
         // traffic and can leak DNS, so make sure it is off.
         set_system_proxy(false);
     } else {
+        clear_tunnel_host_route();
         set_system_proxy(true);
     }
 
@@ -1787,17 +1925,47 @@ fn cleanup() {
 async fn ping_server(address: String, port: u16) -> Result<u64, String> {
     tokio::task::spawn_blocking(move || {
         use std::net::TcpStream;
+        use std::sync::mpsc;
         use std::time::{Duration, Instant};
 
         let target = format!("{address}:{port}");
         let addrs: Vec<std::net::SocketAddr> = std::net::ToSocketAddrs::to_socket_addrs(&target as &str)
             .map_err(|e| format!("DNS fail: {e}"))?
             .collect();
-        let first = addrs.first().ok_or("no address")?;
+        if addrs.is_empty() {
+            return Err("no address".into());
+        }
 
+        // Happy eyeballs: race every resolved address (IPv4 first, as Windows
+        // returns it) instead of trusting the first entry. A network that
+        // advertises IPv6 but cannot route it used to make healthy IPv4
+        // servers show as "ERR" after the 2 s timeout.
+        let (tx, rx) = mpsc::channel();
         let start = Instant::now();
-        TcpStream::connect_timeout(first, Duration::from_secs(2)).map_err(|e| e.to_string())?;
-        Ok(start.elapsed().as_millis() as u64)
+        for addr in addrs.into_iter().take(4) {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let r = TcpStream::connect_timeout(&addr, Duration::from_millis(1800));
+                let elapsed = start.elapsed().as_millis() as u64;
+                let _ = tx.send(r.map(|_| elapsed).map_err(|e| format!("{addr}: {e}")));
+            });
+        }
+        drop(tx);
+
+        let deadline = Instant::now() + Duration::from_millis(2200);
+        let mut last_err = "timed out".to_string();
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            match rx.recv_timeout(left) {
+                Ok(Ok(ms)) => return Ok(ms),
+                Ok(Err(e)) => last_err = e,
+                Err(_) => break,
+            }
+        }
+        Err(last_err)
     })
     .await
     .map_err(|e| format!("ping task failed: {e}"))?
@@ -1919,179 +2087,28 @@ async fn get_net_speed() -> Result<Value, String> {
     .map_err(|e| format!("net speed task failed: {e}"))?
 }
 
+#[cfg(target_os = "windows")]
+const PINNED_XRAY_VERSION: &str = "26.3.27";
+
+/// This app's transport is VLESS + WebSocket. Newer Xray releases keep
+/// changing WS/fingerprint behaviour, and the last several have made real
+/// handshakes slower, so the core version is pinned on purpose. Users can
+/// still replace the binary manually, but the in-app updater will not offer
+/// an untested build.
 #[tauri::command]
 async fn check_xray_core_update() -> Result<Option<Value>, String> {
-    let body = http_get("https://api.github.com/repos/XTLS/Xray-core/releases/latest").await?;
-    let v: Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-    let tag = v["tag_name"].as_str().unwrap_or("").to_string();
-    if tag.is_empty() { return Ok(None); }
-
-    // strip "v" prefix for comparison
-    let remote_ver = tag.trim_start_matches('v').trim_start_matches('V').to_string();
-    let cur = tokio::task::spawn_blocking(get_core_version_sync)
-        .await
-        .ok()
-        .and_then(|r| r.ok())
-        .unwrap_or_default();
-    let cur_clean = cur.trim_start_matches('v').trim_start_matches('V').trim().to_string();
-
-    // if same version, no update
-    if remote_ver == cur_clean { return Ok(None); }
-
-    // Pick the exact asset for this platform/arch. A loose "contains 64"
-    // match can select Xray-windows-arm64-v8a.zip (or the 32-bit build) on
-    // an x86_64 PC and install a core that cannot run there.
-    let wanted: &[&str] = if cfg!(target_os = "windows") {
-        if cfg!(target_arch = "aarch64") {
-            &["Xray-windows-arm64-v8a.zip"]
-        } else {
-            &["Xray-windows-64.zip"]
-        }
-    } else if cfg!(target_os = "macos") {
-        if cfg!(target_arch = "aarch64") {
-            &["Xray-macos-arm64-v8a.zip"]
-        } else {
-            &["Xray-macos-64.zip"]
-        }
-    } else {
-        &["Xray-linux-64.zip"]
-    };
-    let mut zip_url: Option<String> = None;
-    if let Some(assets) = v["assets"].as_array() {
-        for a in assets {
-            let name = a["name"].as_str().unwrap_or("");
-            if wanted.contains(&name) {
-                zip_url = a["browser_download_url"].as_str().map(|s| s.to_string());
-                break;
-            }
-        }
-        if zip_url.is_none() && cfg!(target_os = "windows") {
-            // fallback for future naming changes, but never the arm64/32 build
-            for a in assets {
-                let name = a["name"].as_str().unwrap_or("");
-                if name.starts_with("Xray-windows-")
-                    && name.ends_with(".zip")
-                    && !name.contains("arm")
-                    && !name.contains("32")
-                {
-                    zip_url = a["browser_download_url"].as_str().map(|s| s.to_string());
-                    break;
-                }
-            }
-        }
-    }
-    let url = match zip_url {
-        Some(u) => u,
-        None => return Ok(None),
-    };
-
-    Ok(Some(json!({
-        "version": remote_ver,
-        "current": cur_clean,
-        "url": url,
-    })))
+    let _ = PINNED_XRAY_VERSION;
+    Ok(None)
 }
 
 #[tauri::command]
-async fn update_xray_core(url: String) -> Result<String, String> {
-    if CONNECTED.load(Ordering::SeqCst) {
-        return Err("Disconnect VPN first".into());
-    }
-
-    let tmp = std::env::temp_dir().join("lionray_xray_update");
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).map_err(|e| format!("temp dir: {e}"))?;
-    let zip_path = tmp.join("xray.zip");
-
-    DL_PROGRESS.store(0, Ordering::Relaxed);
-
-    // download in blocking thread (avoids tokio runtime issues)
-    let dl_url = url.clone();
-    let dl_path = zip_path.clone();
-    tokio::task::spawn_blocking(move || {
-        use std::io::Read;
-        let client = reqwest::blocking::Client::builder()
-            .user_agent("LionRayVPN/1.6")
-            .connect_timeout(std::time::Duration::from_secs(15))
-            .timeout(std::time::Duration::from_secs(300))
-            .build()
-            .map_err(|e| format!("client: {e}"))?;
-
-        let mut resp = client.get(&dl_url).send().map_err(|e| format!("download: {e}"))?;
-        if !resp.status().is_success() {
-            return Err(format!("HTTP {}", resp.status()));
-        }
-
-        let total = resp.content_length().unwrap_or(0);
-        let mut file = std::fs::File::create(&dl_path).map_err(|e| format!("create zip: {e}"))?;
-        let mut buf = [0u8; 256 * 1024];
-        let mut downloaded: u64 = 0;
-        loop {
-            let n = resp.read(&mut buf).map_err(|e| format!("read: {e}"))?;
-            if n == 0 { break; }
-            std::io::Write::write_all(&mut file, &buf[..n]).map_err(|e| format!("write: {e}"))?;
-            downloaded += n as u64;
-            let pct = if total > 0 {
-                (downloaded as f64 / total as f64 * 100.0) as u32
-            } else {
-                let mb = downloaded / (1024 * 1024);
-                (mb as u32 * 4).min(95)
-            };
-            DL_PROGRESS.store(pct.min(99), Ordering::Relaxed);
-        }
-        DL_PROGRESS.store(100, Ordering::Relaxed);
-        Ok::<(), String>(())
-    })
-    .await
-    .map_err(|e| format!("task: {e}"))??;
-
-    DL_PROGRESS.store(0, Ordering::Relaxed);
-
-    let tmp_clone = tmp.clone();
-    tokio::task::spawn_blocking(move || {
-        let extract_dir = tmp_clone.join("extracted");
-        std::fs::create_dir_all(&extract_dir).map_err(|e| format!("extract dir: {e}"))?;
-        {
-            let file = std::fs::File::open(&zip_path).map_err(|e| format!("open zip: {e}"))?;
-            let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("invalid zip: {e}"))?;
-            archive.extract(&extract_dir).map_err(|e| format!("extract: {e}"))?;
-        }
-
-        // find xray dir inside extracted (usually "Xray-windows-64/")
-        let inner = std::fs::read_dir(&extract_dir)
-            .map_err(|e| format!("list extract: {e}"))?
-            .filter_map(|e| e.ok())
-            .find(|e| e.path().is_dir() && e.file_name().to_string_lossy().contains("Xray"))
-            .map(|e| e.path())
-            .unwrap_or(extract_dir.clone());
-
-        let bin_path = find_xray_binary()?;
-        let bundle_dir = bin_path.parent().ok_or("xray dir not found")?;
-        let exe_name = if cfg!(target_os = "windows") { "xray.exe" } else { "xray" };
-
-        for name in [exe_name, "geoip.dat", "geosite.dat"] {
-            let src = inner.join(name);
-            if src.exists() {
-                let dst = bundle_dir.join(name);
-                let _ = std::fs::remove_file(&dst);
-                std::fs::copy(&src, &dst).map_err(|e| format!("copy {name}: {e}"))?;
-            }
-        }
-
-        // remove old version.txt so new binary's real version is used
-        let _ = std::fs::remove_file(bundle_dir.join("version.txt"));
-        let _ = std::fs::remove_dir_all(&tmp_clone);
-        Ok::<(), String>(())
-    })
-    .await
-    .map_err(|e| format!("task: {e}"))??;
-
-    let new_ver = tokio::task::spawn_blocking(get_core_version_sync)
-        .await
-        .ok()
-        .and_then(|r| r.ok())
-        .unwrap_or_else(|| "unknown".into());
-    Ok(new_ver)
+async fn update_xray_core(_url: String) -> Result<String, String> {
+    Err(
+        "Automatic core updates are disabled in this build: the bundled Xray \
+         version is pinned because newer releases changed WebSocket behaviour \
+         and slowed connections. Replace xray.exe manually if needed."
+            .into(),
+    )
 }
 
 #[tauri::command]
@@ -2262,6 +2279,14 @@ pub fn run() {
             relaunch_as_admin,
         ])
         .setup(|app| {
+            // Heal a dead proxy left by a previous crash before the webview
+            // loads, otherwise the whole machine looks offline.
+            restore_stale_proxy();
+            // Remove a host route left behind by a crashed TUN session.
+            clear_tunnel_host_route();
+            // Remove sing-box's leftover registry routing state.
+            restore_singbox_tun_state();
+
             // Attach a real icon to every window so the running process
             // (taskbar) and the desktop shortcut that Windows ties to it never
             // fall back to the blank default icon. The .ico embedded in the exe
@@ -2312,8 +2337,10 @@ pub fn run() {
                         continue;
                     }
                     if retries >= 6 {
-                        AUTO.store(false, Ordering::SeqCst);
-                        CONNECTED.store(false, Ordering::SeqCst);
+                        // Stop retrying, but also restore the system proxy and
+                        // TUN routes: leaving them pointing at a dead core makes
+                        // every app on the machine act offline until a restart.
+                        cleanup();
                         retries = 0;
                         continue;
                     }
@@ -2324,8 +2351,7 @@ pub fn run() {
                             l.ipv6, l.fragment,
                         );
                     } else {
-                        AUTO.store(false, Ordering::SeqCst);
-                        CONNECTED.store(false, Ordering::SeqCst);
+                        cleanup();
                         retries = 0;
                     }
                 }
