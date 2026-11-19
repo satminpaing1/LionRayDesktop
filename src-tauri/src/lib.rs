@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.3";
+pub const APP_VERSION: &str = "1.8.4";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -172,10 +172,20 @@ fn running_as_admin() -> bool {
 
 // True when the local SOCKS listener xray should be serving is actually up.
 fn socks_listening() -> bool {
-    match "127.0.0.1:10808".parse::<std::net::SocketAddr>() {
-        Ok(addr) => std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(600)).is_ok(),
-        Err(_) => false,
+    for _ in 0..3 {
+        if "127.0.0.1:10808"
+            .parse::<std::net::SocketAddr>()
+            .map(|addr| {
+                std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400))
+                    .is_ok()
+            })
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
     }
+    false
 }
 
 // Runs a blocking HTTP request OFF the async runtime (spawn_blocking) so a
@@ -2673,10 +2683,17 @@ pub fn run() {
             // permanently dead node doesn't spawn xray in a loop forever.
             std::thread::spawn(|| {
                 let mut retries: u32 = 0;
+                // A single failed probe must not trigger a full reconnect: xray
+                // can be briefly busy (slow DNS, a large download) and
+                // socks_listening() would report "dead" for one cycle. Require
+                // several consecutive dead probes before tearing the tunnel down.
+                let mut dead_streak: u32 = 0;
+                const DEAD_THRESHOLD: u32 = 2; // 2 * 10s = 20s of confirmed death
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(10));
                     if !AUTO.load(Ordering::SeqCst) {
                         retries = 0;
+                        dead_streak = 0;
                         continue;
                     }
                     let child_alive = match CHILD.lock() {
@@ -2694,8 +2711,15 @@ pub fn run() {
                     let dead = !child_alive || !socks_listening() || (tun_needed && !tun_alive());
                     if !dead {
                         retries = 0;
+                        dead_streak = 0;
                         continue;
                     }
+                    dead_streak += 1;
+                    if dead_streak < DEAD_THRESHOLD {
+                        // transient hiccup — wait another cycle before acting
+                        continue;
+                    }
+                    dead_streak = 0;
                     if retries >= 6 {
                         // Stop retrying, but also restore the system proxy and
                         // TUN routes: leaving them pointing at a dead core makes
@@ -2710,6 +2734,10 @@ pub fn run() {
                             &l.server, &l.routing, &l.dns, l.ad_block, &l.bypass, l.tun, l.udp,
                             l.ipv6, l.fragment,
                         );
+                        // cooldown: give the new tunnel time to settle before the
+                        // next probe, so a slow handshake isn't mistaken for a
+                        // fresh failure.
+                        std::thread::sleep(std::time::Duration::from_secs(15));
                     } else {
                         cleanup();
                         retries = 0;
