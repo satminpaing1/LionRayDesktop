@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.2";
+pub const APP_VERSION: &str = "1.8.3";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -2087,28 +2087,388 @@ async fn get_net_speed() -> Result<Value, String> {
     .map_err(|e| format!("net speed task failed: {e}"))?
 }
 
-#[cfg(target_os = "windows")]
-const PINNED_XRAY_VERSION: &str = "26.3.27";
-
-/// This app's transport is VLESS + WebSocket. Newer Xray releases keep
-/// changing WS/fingerprint behaviour, and the last several have made real
-/// handshakes slower, so the core version is pinned on purpose. Users can
-/// still replace the binary manually, but the in-app updater will not offer
-/// an untested build.
 #[tauri::command]
 async fn check_xray_core_update() -> Result<Option<Value>, String> {
-    let _ = PINNED_XRAY_VERSION;
-    Ok(None)
+    let body = http_get("https://api.github.com/repos/XTLS/Xray-core/releases/latest").await?;
+    let v: Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    let tag = v["tag_name"].as_str().unwrap_or("").to_string();
+    if tag.is_empty() {
+        return Ok(None);
+    }
+
+    // strip "v" prefix for comparison
+    let remote_ver = tag.trim_start_matches('v').trim_start_matches('V').to_string();
+    let cur = tokio::task::spawn_blocking(get_core_version_sync)
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or_default();
+    let cur_clean = cur.trim_start_matches('v').trim_start_matches('V').trim().to_string();
+
+    // if same version, no update
+    if remote_ver == cur_clean {
+        return Ok(None);
+    }
+
+    // Pick the exact asset for this platform/arch. A loose "contains 64"
+    // match can select Xray-windows-arm64-v8a.zip (or the 32-bit build) on
+    // an x86_64 PC and install a core that cannot run there.
+    let wanted: &[&str] = if cfg!(target_os = "windows") {
+        if cfg!(target_arch = "aarch64") {
+            &["Xray-windows-arm64-v8a.zip"]
+        } else {
+            &["Xray-windows-64.zip"]
+        }
+    } else if cfg!(target_os = "macos") {
+        if cfg!(target_arch = "aarch64") {
+            &["Xray-macos-arm64-v8a.zip"]
+        } else {
+            &["Xray-macos-64.zip"]
+        }
+    } else {
+        &["Xray-linux-64.zip"]
+    };
+    let mut zip_url: Option<String> = None;
+    if let Some(assets) = v["assets"].as_array() {
+        for a in assets {
+            let name = a["name"].as_str().unwrap_or("");
+            if wanted.contains(&name) {
+                zip_url = a["browser_download_url"].as_str().map(|s| s.to_string());
+                break;
+            }
+        }
+        if zip_url.is_none() && cfg!(target_os = "windows") {
+            // fallback for future naming changes, but never the arm64/32 build
+            for a in assets {
+                let name = a["name"].as_str().unwrap_or("");
+                if name.starts_with("Xray-windows-")
+                    && name.ends_with(".zip")
+                    && !name.contains("arm")
+                    && !name.contains("32")
+                {
+                    zip_url = a["browser_download_url"].as_str().map(|s| s.to_string());
+                    break;
+                }
+            }
+        }
+    }
+    let url = match zip_url {
+        Some(u) => u,
+        None => return Ok(None),
+    };
+
+    Ok(Some(json!({
+        "version": remote_ver,
+        "current": cur_clean,
+        "url": url,
+    })))
 }
 
 #[tauri::command]
-async fn update_xray_core(_url: String) -> Result<String, String> {
-    Err(
-        "Automatic core updates are disabled in this build: the bundled Xray \
-         version is pinned because newer releases changed WebSocket behaviour \
-         and slowed connections. Replace xray.exe manually if needed."
-            .into(),
-    )
+async fn update_xray_core(url: String) -> Result<String, String> {
+    if CONNECTED.load(Ordering::SeqCst) {
+        return Err("Disconnect VPN first".into());
+    }
+
+    // 1) download
+    let tmp = std::env::temp_dir().join("lionray_xray_update");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).map_err(|e| format!("temp dir: {e}"))?;
+    let zip_path = tmp.join("xray.zip");
+
+    DL_PROGRESS.store(0, Ordering::Relaxed);
+    let dl_url = url.clone();
+    let dl_path = zip_path.clone();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let client = reqwest::blocking::Client::builder()
+            .user_agent("LionRayVPN/1.8")
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .timeout(std::time::Duration::from_secs(300))
+            .build()
+            .map_err(|e| format!("client: {e}"))?;
+        let mut resp = client.get(&dl_url).send().map_err(|e| format!("download: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("HTTP {}", resp.status()));
+        }
+        let total = resp.content_length().unwrap_or(0);
+        let mut file = std::fs::File::create(&dl_path).map_err(|e| format!("create zip: {e}"))?;
+        let mut buf = [0u8; 256 * 1024];
+        let mut downloaded: u64 = 0;
+        loop {
+            let n = resp.read(&mut buf).map_err(|e| format!("read: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            std::io::Write::write_all(&mut file, &buf[..n]).map_err(|e| format!("write: {e}"))?;
+            downloaded += n as u64;
+            let pct = if total > 0 {
+                (downloaded as f64 / total as f64 * 100.0) as u32
+            } else {
+                let mb = downloaded / (1024 * 1024);
+                (mb as u32 * 4).min(95)
+            };
+            DL_PROGRESS.store(pct.min(99), Ordering::Relaxed);
+        }
+        DL_PROGRESS.store(100, Ordering::Relaxed);
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|e| format!("task: {e}"))??;
+    DL_PROGRESS.store(0, Ordering::Relaxed);
+
+    // 2) extract
+    let (new_exe, bundle_dir) = tokio::task::spawn_blocking({
+        let tmp = tmp.clone();
+        let zip_path = zip_path.clone();
+        move || {
+            let extract_dir = tmp.join("extracted");
+            std::fs::create_dir_all(&extract_dir).map_err(|e| format!("extract dir: {e}"))?;
+            {
+                let file = std::fs::File::open(&zip_path).map_err(|e| format!("open zip: {e}"))?;
+                let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("invalid zip: {e}"))?;
+                archive.extract(&extract_dir).map_err(|e| format!("extract: {e}"))?;
+            }
+            let inner = std::fs::read_dir(&extract_dir)
+                .map_err(|e| format!("list extract: {e}"))?
+                .filter_map(|e| e.ok())
+                .find(|e| e.path().is_dir() && e.file_name().to_string_lossy().contains("Xray"))
+                .map(|e| e.path())
+                .unwrap_or(extract_dir.clone());
+            let exe_name = if cfg!(target_os = "windows") {
+                "xray.exe"
+            } else {
+                "xray"
+            };
+            let new_exe = inner.join(exe_name);
+            if !new_exe.exists() {
+                return Err("xray binary not found in archive".to_string());
+            }
+            let bin_path = find_xray_binary()?;
+            let bundle_dir = bin_path.parent().ok_or("xray dir not found")?.to_path_buf();
+            Ok((new_exe, bundle_dir))
+        }
+    })
+    .await
+    .map_err(|e| format!("task: {e}"))??;
+
+    let exe_name = if cfg!(target_os = "windows") {
+        "xray.exe"
+    } else {
+        "xray"
+    };
+    let config_path = dirs::config_dir()
+        .map(|d| d.join("lionray-vpn").join("config.json"))
+        .unwrap_or_default();
+
+    // 3) baseline latency with the CURRENT core
+    let old_exe = find_xray_binary().ok();
+    let old_median = if config_path.exists() {
+        if let Some(ref oe) = old_exe {
+            tokio::task::spawn_blocking({
+                let oe = oe.clone();
+                let cp = config_path.clone();
+                move || measure_core_latency_sync(&oe, &cp)
+            })
+            .await
+            .ok()
+            .flatten()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // 4) back up the current (working) core
+    let bundle_dir_clone = bundle_dir.clone();
+    tokio::task::spawn_blocking(move || backup_bundle(&bundle_dir_clone))
+        .await
+        .ok();
+
+    // 5) swap in the new core
+    let swap_res = tokio::task::spawn_blocking({
+        let bundle_dir = bundle_dir.clone();
+        let inner = new_exe.parent().unwrap().to_path_buf();
+        let exe_name = exe_name.to_string();
+        move || {
+            for name in [exe_name.as_str(), "geoip.dat", "geosite.dat"] {
+                let src = inner.join(name);
+                if src.exists() {
+                    let dst = bundle_dir.join(name);
+                    let _ = std::fs::remove_file(&dst);
+                    std::fs::copy(&src, &dst).map_err(|e| format!("copy {name}: {e}"))?;
+                }
+            }
+            let _ = std::fs::remove_file(bundle_dir.join("version.txt"));
+            Ok::<(), String>(())
+        }
+    })
+    .await;
+    if let Err(e) = swap_res {
+        let bd = bundle_dir.clone();
+        tokio::task::spawn_blocking(move || restore_bundle_backup(&bd)).await.ok();
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(format!("swap failed: {e}"));
+    }
+
+    // 6) validate config with the new core
+    if config_path.exists() {
+        let out = tokio::task::spawn_blocking({
+            let new_exe = new_exe.clone();
+            let cp = config_path.clone();
+            move || std::process::Command::new(&new_exe).args(["run", "-test", "-c"]).arg(&cp).output()
+        })
+        .await
+        .ok()
+        .and_then(|r| r.ok());
+        let ok = out.map(|o| o.status.success()).unwrap_or(true);
+        if !ok {
+            let bd = bundle_dir.clone();
+            tokio::task::spawn_blocking(move || restore_bundle_backup(&bd)).await.ok();
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err("New core failed config validation - kept previous core.".to_string());
+        }
+    }
+
+    // 7) connectivity + latency test with the new core
+    let new_median = if config_path.exists() {
+        tokio::task::spawn_blocking({
+            let ne = new_exe.clone();
+            let cp = config_path.clone();
+            move || measure_core_latency_sync(&ne, &cp)
+        })
+        .await
+        .ok()
+        .flatten()
+    } else {
+        Some(0)
+    };
+
+    // rollback if broken or much slower (2.5x)
+    let rollback = match (old_median, new_median) {
+        (Some(o), Some(n)) if n == -2 => true, // broken
+        (Some(o), Some(n)) if n >= 0 && o > 0 && n > o * 5 / 2 => true,
+        (None, Some(n)) if n == -2 => true,
+        _ => false,
+    };
+    if rollback {
+        let bd = bundle_dir.clone();
+        tokio::task::spawn_blocking(move || restore_bundle_backup(&bd)).await.ok();
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err("New core is slower or broken - kept previous core.".to_string());
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp);
+    let new_ver = tokio::task::spawn_blocking(get_core_version_sync)
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or_else(|| "unknown".into());
+    Ok(new_ver)
+}
+
+#[cfg(target_os = "windows")]
+fn backup_bundle(bundle_dir: &std::path::Path) {
+    for name in ["xray.exe", "geoip.dat", "geosite.dat"] {
+        let src = bundle_dir.join(name);
+        if src.exists() {
+            let _ = std::fs::copy(&src, bundle_dir.join(format!("{}.bak", name)));
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn restore_bundle_backup(bundle_dir: &std::path::Path) {
+    for name in ["xray.exe", "geoip.dat", "geosite.dat"] {
+        let bak = bundle_dir.join(format!("{}.bak", name));
+        if bak.exists() {
+            let dst = bundle_dir.join(name);
+            let _ = std::fs::remove_file(&dst);
+            let _ = std::fs::copy(&bak, &dst);
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn backup_bundle(_d: &std::path::Path) {}
+#[cfg(not(target_os = "windows"))]
+fn restore_bundle_backup(_d: &std::path::Path) {}
+
+// Returns: -2 = broken (socks never came up), -1 = curl unavailable (skip),
+// >=0 = median TLS handshake time in ms.
+fn measure_core_latency_sync(exe: &std::path::Path, config_path: &std::path::Path) -> Option<i64> {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["run", "-c"]).arg(config_path);
+    if let Some(d) = config_path.parent() {
+        cmd.current_dir(d);
+    }
+    cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    hide_window(&mut cmd);
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(_) => return Some(-1),
+    };
+    let mut ready = false;
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if child.try_wait().ok().flatten().is_some() {
+            break;
+        }
+        if socks_listening() {
+            ready = true;
+            break;
+        }
+    }
+    if !ready {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Some(-2);
+    }
+
+    // check curl availability
+    let curl_path = if std::path::Path::new(r"C:\Windows\System32\curl.exe").exists() {
+        r"C:\Windows\System32\curl.exe"
+    } else {
+        "curl"
+    };
+    // quick spawn test
+    if std::process::Command::new(curl_path).arg("--version").output().is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Some(-1);
+    }
+
+    let mut samples: Vec<i64> = Vec::new();
+    for _ in 0..3 {
+        let out = std::process::Command::new(curl_path)
+            .args([
+                "-s",
+                "--socks5-hostname",
+                "127.0.0.1:10808",
+                "--max-time",
+                "15",
+                "-o",
+                "NUL",
+                "-w",
+                "%{time_appconnect}",
+                "https://www.google.com/generate_204",
+            ])
+            .output();
+        if let Ok(o) = out {
+            let s = String::from_utf8_lossy(&o.stdout);
+            if let Ok(ms) = s.trim().parse::<f64>() {
+                samples.push((ms * 1000.0) as i64);
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    if samples.is_empty() {
+        return Some(-1);
+    }
+    samples.sort();
+    Some(samples[samples.len() / 2])
 }
 
 #[tauri::command]
