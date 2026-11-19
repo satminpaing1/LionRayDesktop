@@ -103,6 +103,38 @@ jobs:
           "singbox_tag=$singbox" >> $env:GITHUB_OUTPUT
           Write-Host "App $app / Xray $xray / sing-box $singbox"
 
+      - name: Guard release version (manual runs only)
+        if: github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $app = "${{ steps.ver.outputs.app }}"
+          $repo = "${{ github.repository }}"
+          $h = @{ Authorization = "Bearer $env:GH_TOKEN"; 'User-Agent' = 'lionray-ci'; Accept = 'application/vnd.github+json' }
+
+          # Never let a manual run overwrite an older/unrelated release. This is
+          # exactly what would happen if the repo version was behind the
+          # released macOS versions while a tag of the same name already exists.
+          $latestTag = ''
+          try {
+            $latestTag = (Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" -Headers $h).tag_name
+          } catch { Write-Host 'no latest release yet' }
+          if ($latestTag) {
+            $lv = [version]((($latestTag -replace '^v','') -replace '[^0-9.].*$',''))
+            $nv = [version](($app -replace '[^0-9.].*$',''))
+            if ($nv -le $lv) { throw "requested v$app must be newer than latest release $latestTag" }
+            Write-Host "latest release $latestTag -> building v$app"
+          }
+
+          $tagExists = $false
+          try {
+            $null = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/git/ref/tags/v$app" -Headers $h
+            $tagExists = $true
+          } catch { $tagExists = $false }
+          if ($tagExists) { throw "tag v$app already exists - choose a new version" }
+
       - name: Set app version
         shell: pwsh
         run: |
