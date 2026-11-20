@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.20";
+pub const APP_VERSION: &str = "1.8.21";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -357,12 +357,16 @@ fn probe_direct() -> bool {
 // Pre-flight before enabling a machine-wide proxy/TUN. Plain HTTP endpoints
 // cross the full VLESS/WS tunnel; raced in parallel for fast connect.
 fn verify_tunnel_ready() -> bool {
+    // This server needs ~2 s per 204 probe. URLs are raced in parallel so a
+    // healthy tunnel still returns in ~2 s; the 6 s budget only prevents false
+    // "Server is not responding" failures on a slow-but-working line.
     probe_urls_race_socks(
         &[
             "http://cp.cloudflare.com/generate_204",
             "http://www.gstatic.com/generate_204",
+            "http://www.msftconnecttest.com/connecttest.txt",
         ],
-        2,
+        6,
     )
 }
 
@@ -3477,6 +3481,14 @@ pub fn run() {
                         if dead_streak < DEAD_THRESHOLD {
                             continue;
                         }
+                    }
+                    // Re-check intent right before reconnect: a manual
+                    // disconnect may have happened mid-tick.
+                    if !AUTO.load(Ordering::SeqCst) {
+                        retries = 0;
+                        dead_streak = 0;
+                        probe_fail_streak = 0;
+                        continue;
                     }
                     dead_streak = 0;
                     probe_fail_streak = 0;
