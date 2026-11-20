@@ -544,7 +544,8 @@ function App() {
     if (!list.length) return showToast("No valid servers found", true);
     const tagged = list.map((s) => ({ ...s, id: ++idCounter, ...(subId ? { subId } : {}) }));
     setServers((prev) => [...prev, ...tagged]);
-    setActiveId((cur) => cur ?? tagged[0].id);
+    // Select the newly imported server so Connect uses it immediately.
+    setActiveId(tagged[0].id);
     showToast(`Imported ${tagged.length} server${tagged.length > 1 ? "s" : ""} ✓`);
   };
 
@@ -570,11 +571,15 @@ function App() {
         setSubs((prev) => [...prev, { id: sid, name: hostOf(url), url, loading: true }]);
         try {
           const channel = new Channel();
+          let firstId: number | null = null;
           channel.onmessage = (srv: unknown) => {
             const s = srv as Server;
-            setServers((prev) => [...prev, { ...s, id: ++idCounter, subId: sid }]);
+            const nid = ++idCounter;
+            if (firstId == null) firstId = nid;
+            setServers((prev) => [...prev, { ...s, id: nid, subId: sid }]);
           };
           await invoke("fetch_subscription_stream", { url, onServer: channel });
+          if (firstId != null) setActiveId(firstId);
           setSubs((prev) => prev.map((s) => (s.id === sid ? { ...s, loading: false } : s)));
           showToast("Subscription imported ✓");
         } catch (e) {
@@ -600,11 +605,15 @@ function App() {
     setTab("subs");
     try {
       const channel = new Channel();
+      let firstId: number | null = null;
       channel.onmessage = (srv: unknown) => {
         const s = srv as Server;
-        setServers((prev) => [...prev, { ...s, id: ++idCounter, subId: sid }]);
+        const nid = ++idCounter;
+        if (firstId == null) firstId = nid;
+        setServers((prev) => [...prev, { ...s, id: nid, subId: sid }]);
       };
       await invoke("fetch_subscription_stream", { url, onServer: channel });
+      if (firstId != null) setActiveId(firstId);
       setSubs((prev) => prev.map((s) => (s.id === sid ? { ...s, loading: false } : s)));
       showToast("Subscription imported ✓");
     } catch (e) {
@@ -670,11 +679,15 @@ function App() {
         const sid = ++idCounter;
         setSubs((prev) => [...prev, { id: sid, name: hostOf(trimmed), url: trimmed, loading: true }]);
         const channel = new Channel();
+        let firstId: number | null = null;
         channel.onmessage = (srv: unknown) => {
           const s = srv as Server;
-          setServers((prev) => [...prev, { ...s, id: ++idCounter, subId: sid }]);
+          const nid = ++idCounter;
+          if (firstId == null) firstId = nid;
+          setServers((prev) => [...prev, { ...s, id: nid, subId: sid }]);
         };
         await invoke("fetch_subscription_stream", { url: trimmed, onServer: channel });
+        if (firstId != null) setActiveId(firstId);
         setSubs((prev) => prev.map((s) => (s.id === sid ? { ...s, loading: false } : s)));
         showToast("Subscription imported ✓");
       } else {
