@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.22";
+pub const APP_VERSION: &str = "1.8.23";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -345,10 +345,13 @@ fn verify_tunnel_ready() -> bool {
 
 fn verify_tun_ready() -> bool {
     // TUN/DNS/route setup can take a few seconds after the adapter appears.
+    // Real traffic through the adapter is the only proof it actually works;
+    // a route-table entry alone can exist while packets never enter the TUN.
     probe_urls_race_direct(
         &[
             "http://cp.cloudflare.com/generate_204",
             "http://www.gstatic.com/generate_204",
+            "http://www.msftconnecttest.com/connecttest.txt",
         ],
         6,
     )
@@ -2397,26 +2400,16 @@ fn establish(
         // Give routes/DNS a moment to settle before the check.
         std::thread::sleep(std::time::Duration::from_millis(300));
 
-        // Verify the adapter actually captures traffic (a valid non-tun
-        // default route); if not, fall back to proxy mode so the user is not
-        // stuck offline.
-        let mut tun_effective = tun_captures_all();
-        if !tun_effective {
-            app_log("TUN check failed - trying traffic probe");
-            // Traffic probe doesn’t depend on adapter naming quirks: if some
-            // interface still carries traffic, accept it as effective.
-            tun_effective = probe_urls_race_direct(
-                &[
-                    "http://cp.cloudflare.com/generate_204",
-                    "http://www.gstatic.com/generate_204",
-                ],
-                3,
-            );
-        }
+        // The route-table check is only a hint: a second default route (e.g.
+        // a virtual adapter or a Wi-Fi route with metric 0) can make it pass
+        // even while traffic never enters the tunnel. Always send a REAL
+        // request through the adapter — that is the only proof TUN works.
+        let routes_ok = tun_captures_all();
+        let tun_effective = verify_tun_ready();
         if tun_effective {
-            app_log("TUN confirmed (route check ok)");
+            app_log(&format!("TUN confirmed (traffic probe ok, route_check={routes_ok})"));
         } else {
-            app_log("TUN route check failed - enabling proxy fallback");
+            app_log("TUN traffic probe failed - enabling proxy fallback");
             stop_tun();
             clear_tunnel_host_route();
             take_over_proxy(true);
