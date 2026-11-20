@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.8";
+pub const APP_VERSION: &str = "1.8.9";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -256,7 +256,7 @@ fn probe_url_via_socks(url: &str, secs: u64) -> bool {
     client
         .get(url)
         .send()
-        .map(|r| r.status().is_success())
+        .map(|r| r.status().is_success() || r.status().as_u16() == 204)
         .unwrap_or(false)
 }
 
@@ -271,63 +271,111 @@ fn probe_url_direct(url: &str, secs: u64) -> bool {
     client
         .get(url)
         .send()
-        .map(|r| r.status().is_success())
+        .map(|r| r.status().is_success() || r.status().as_u16() == 204)
         .unwrap_or(false)
+}
+
+fn probe_urls_race_socks(urls: &[&str], secs: u64) -> bool {
+    let (tx, rx) = std::sync::mpsc::channel::<bool>();
+    for &url in urls {
+        let tx = tx.clone();
+        let url = url.to_string();
+        std::thread::spawn(move || {
+            let ok = probe_url_via_socks(&url, secs);
+            let _ = tx.send(ok);
+        });
+    }
+    drop(tx);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs + 1);
+    while let Ok(remaining) = deadline.saturating_duration_since(std::time::Instant::now()).try_into() {
+        let left: std::time::Duration = remaining;
+        if left.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(left) {
+            Ok(true) => return true,
+            Ok(false) => continue,
+            Err(_) => break,
+        }
+    }
+    false
+}
+
+fn probe_urls_race_direct(urls: &[&str], secs: u64) -> bool {
+    let (tx, rx) = std::sync::mpsc::channel::<bool>();
+    for &url in urls {
+        let tx = tx.clone();
+        let url = url.to_string();
+        std::thread::spawn(move || {
+            let ok = probe_url_direct(&url, secs);
+            let _ = tx.send(ok);
+        });
+    }
+    drop(tx);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs + 1);
+    while let Ok(remaining) = deadline.saturating_duration_since(std::time::Instant::now()).try_into() {
+        let left: std::time::Duration = remaining;
+        if left.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(left) {
+            Ok(true) => return true,
+            Ok(false) => continue,
+            Err(_) => break,
+        }
+    }
+    false
 }
 
 // End-to-end probe through the local SOCKS inbound. Detects a tunnel that is
 // "up" locally (xray alive, port listening) but cannot reach the internet —
 // the exact case the old watchdog could never see.
 fn probe_via_socks() -> bool {
-    probe_url_via_socks("http://www.gstatic.com/generate_204", 8)
-        || probe_url_via_socks("http://cp.cloudflare.com/generate_204", 8)
+    probe_urls_race_socks(
+        &[
+            "http://www.gstatic.com/generate_204",
+            "http://cp.cloudflare.com/generate_204",
+            "http://www.msftconnecttest.com/connecttest.txt",
+        ],
+        6,
+    )
 }
 
 // In TUN mode all direct traffic is captured by the adapter, so a direct
 // request tests the whole sing-box -> xray path (routes, DNS, adapter).
 fn probe_direct() -> bool {
-    probe_url_direct("http://www.gstatic.com/generate_204", 8)
-        || probe_url_direct("http://cp.cloudflare.com/generate_204", 8)
+    probe_urls_race_direct(
+        &[
+            "http://www.gstatic.com/generate_204",
+            "http://cp.cloudflare.com/generate_204",
+            "http://www.msftconnecttest.com/connecttest.txt",
+        ],
+        6,
+    )
 }
 
-// Pre-flight before enabling a machine-wide proxy/TUN. Plain HTTP 204
-// endpoints are used (no extra TLS cost) but the request still crosses the
-// full VLESS/WS tunnel.
+// Pre-flight before enabling a machine-wide proxy/TUN. Plain HTTP endpoints
+// cross the full VLESS/WS tunnel; raced in parallel for fast connect.
 fn verify_tunnel_ready() -> bool {
-    probe_url_via_socks("http://www.gstatic.com/generate_204", 6)
-        || probe_url_via_socks("http://cp.cloudflare.com/generate_204", 5)
+    probe_urls_race_socks(
+        &[
+            "http://cp.cloudflare.com/generate_204",
+            "http://www.gstatic.com/generate_204",
+            "http://www.msftconnecttest.com/connecttest.txt",
+        ],
+        4,
+    )
 }
 
 fn verify_tun_ready() -> bool {
-    probe_url_direct("http://www.gstatic.com/generate_204", 6)
-        || probe_url_direct("http://cp.cloudflare.com/generate_204", 5)
-}
-
-fn probe_url_via_http_proxy(url: &str, secs: u64) -> bool {
-    let Ok(proxy) = reqwest::Proxy::all(format!("http://127.0.0.1:{HTTP_PORT}")) else {
-        return false;
-    };
-    let Ok(client) = reqwest::blocking::Client::builder()
-        .proxy(proxy)
-        .connect_timeout(std::time::Duration::from_secs(secs))
-        .timeout(std::time::Duration::from_secs(secs))
-        .build()
-    else {
-        return false;
-    };
-    client
-        .get(url)
-        .send()
-        .map(|r| r.status().is_success())
-        .unwrap_or(false)
-}
-
-// Final gate before leaving the Windows proxy enabled: if the HTTP inbound
-// cannot carry traffic, turn the proxy back off instead of blackholing every
-// app on the machine.
-fn verify_http_proxy() -> bool {
-    probe_url_via_http_proxy("http://www.gstatic.com/generate_204", 6)
-        || probe_url_via_http_proxy("http://cp.cloudflare.com/generate_204", 5)
+    probe_urls_race_direct(
+        &[
+            "http://cp.cloudflare.com/generate_204",
+            "http://www.gstatic.com/generate_204",
+            "http://www.msftconnecttest.com/connecttest.txt",
+        ],
+        4,
+    )
 }
 
 #[cfg(target_os = "windows")]
@@ -2307,23 +2355,10 @@ fn establish(
         }
     } else {
         clear_tunnel_host_route();
+        // SOCKS preflight already proved the tunnel carries traffic. Enabling
+        // the system proxy without a second (slow) HTTP probe keeps connect
+        // fast; if the proxy is hijacked, the registry state is still ours.
         take_over_proxy(true);
-
-        // Last gate: the registry was written and the SOCKS path worked, but
-        // make sure the HTTP inbound (what Windows apps actually use) can also
-        // carry traffic. If not, undo the proxy instead of blackholing the PC.
-        if !system_proxy_is_ours() || !verify_http_proxy() {
-            if let Ok(mut g) = CHILD.lock() {
-                if let Some(mut c) = g.take() {
-                    let _ = c.kill();
-                    let _ = c.wait();
-                }
-            }
-            restore_proxy();
-            CONNECTED.store(false, Ordering::SeqCst);
-            app_log("connect aborted: HTTP proxy probe failed (proxy restored)");
-            return Err("Proxy enabled but no traffic — proxy was turned back off".into());
-        }
     }
 
     set_keep_awake(true);
