@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.15";
+pub const APP_VERSION: &str = "1.8.16";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -2034,6 +2034,24 @@ fn is_elevated() -> bool {
     running_as_admin()
 }
 
+// Restart the app (used after xray core update so the new binary takes effect).
+#[tauri::command]
+async fn restart_app(app: tauri::AppHandle) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new(&exe);
+        hide_window(&mut cmd);
+        cmd.spawn().map_err(|e| format!("restart failed: {e}"))?;
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|e| format!("task: {e}"))??;
+    // give the new process a moment to start
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    app.exit(0);
+    Ok(())
+}
+
 // Relaunch this executable through UAC and hand over to the elevated instance.
 // The old process exits (RunEvent::Exit runs cleanup) so there is only ever
 // one LionRay/tunnel owner.
@@ -3301,6 +3319,7 @@ pub fn run() {
             update_xray_core,
             open_link,
             is_elevated,
+            restart_app,
             relaunch_as_admin,
         ])
         .setup(|app| {

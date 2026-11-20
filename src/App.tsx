@@ -959,7 +959,12 @@ function App() {
           setCoreVer(newVer);
           setXrayUpdate(null);
           setXrayCheckMsg(`Updated to v${newVer} ✓`);
-          showToast(`Xray core → ${newVer} ✓  Restart app to use.`);
+          showToast(`Xray core → ${newVer} ✓  Restarting app…`);
+          // auto-restart so the new core binary takes effect immediately
+          // persist selection so it survives the restart
+          saveStore("lr_servers", servers);
+          saveStore("lr_active", activeId);
+          setTimeout(() => { invoke("restart_app").catch(() => {}); }, 800);
         } catch (e: any) {
           const msg = typeof e === "string" ? e : e?.message || "Update failed";
           showToast(msg.slice(0, 120), true);
