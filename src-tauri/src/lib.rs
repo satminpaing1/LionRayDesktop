@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.19";
+pub const APP_VERSION: &str = "1.8.20";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -189,7 +189,7 @@ fn socks_listening() -> bool {
     "127.0.0.1:10808"
         .parse::<std::net::SocketAddr>()
         .map(|addr| {
-            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500))
+            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(1000))
                 .is_ok()
         })
         .unwrap_or(false)
@@ -3421,7 +3421,7 @@ pub fn run() {
                 let mut dead_streak: u32 = 0;
                 let mut probe_fail_streak: u32 = 0;
                 let mut tick: u32 = 0;
-                const DEAD_THRESHOLD: u32 = 3; // 3 * 5 s for soft failures
+                const DEAD_THRESHOLD: u32 = 5; // 5 * 5 s for soft failures
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(5));
                     tick = tick.wrapping_add(1);
@@ -3449,16 +3449,16 @@ pub fn run() {
                     // End-to-end probe every 30 s. In TUN mode a direct request
                     // traverses the adapter, so it tests the whole path.
                     let mut net_dead = false;
-                    if !hard_dead && !soft_dead && tick % 12 == 0 {
+                    if !hard_dead && !soft_dead && tick % 24 == 0 {
                         let ok = if tun_needed { probe_direct() } else { probe_via_socks() };
                         if ok {
                             probe_fail_streak = 0;
                         } else {
                             probe_fail_streak += 1;
                             app_log(&format!(
-                                "watchdog: tunnel probe failed ({probe_fail_streak}/5)"
+                                "watchdog: tunnel probe failed ({probe_fail_streak}/10)"
                             ));
-                            net_dead = probe_fail_streak >= 5;
+                            net_dead = probe_fail_streak >= 10;
                         }
                     }
 
