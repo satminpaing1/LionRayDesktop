@@ -506,3 +506,27 @@ input:checked + .slider::before { transform: translateX(20px); }
   background: transparent; color: var(--sub); font-size: 12px; cursor: pointer; flex-shrink: 0;
 }
 .row-act:hover { background: var(--primary-soft); color: var(--primary); }
+
+/* ── in-app log viewer ── */
+.log-tabs {
+  display: flex; gap: 6px; margin: 6px 0 10px;
+}
+.log-tab {
+  flex: 1; padding: 9px 0; border: 1px solid var(--line); border-radius: 10px;
+  background: var(--card); color: var(--sub); font-size: 12px; font-weight: 700;
+  cursor: pointer;
+}
+.log-tab.on { background: var(--primary-soft); color: var(--primary); border-color: var(--primary); }
+.log-actions { display: flex; gap: 8px; margin-bottom: 10px; }
+.log-actions .btn-secondary { flex: 1; font-size: 12px; padding: 9px 0; }
+.log-actions button:disabled { opacity: .5; cursor: default; }
+.log-box {
+  background: #0d1424; border: 1px solid var(--line); border-radius: 12px;
+  padding: 10px; min-height: 260px; max-height: 60vh; overflow: auto;
+}
+.dark .log-box { background: #060a14; }
+.log-pre {
+  font-family: Consolas, "Courier New", monospace; font-size: 10.5px;
+  line-height: 1.55; white-space: pre-wrap; word-break: break-all;
+  color: #cbd5e1; user-select: text;
+}

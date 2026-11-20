@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.23";
+pub const APP_VERSION: &str = "1.8.24";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -2038,6 +2038,51 @@ fn rollback_xray_core() -> Result<String, String> {
     Ok(ver)
 }
 
+// Logs live in %APPDATA%\lionray-vpn. Expose them to the UI so the user can
+// inspect what happened without hunting for files in Explorer.
+#[tauri::command]
+fn read_logs() -> Result<serde_json::Value, String> {
+    let dir = dirs::config_dir()
+        .ok_or("no config dir")?
+        .join("lionray-vpn");
+    let mut out = serde_json::Map::new();
+    for (key, name) in [
+        ("app", "app.log"),
+        ("xray", "xray.log"),
+        ("singbox", "singbox.log"),
+    ] {
+        let mut text = std::fs::read_to_string(dir.join(name)).unwrap_or_default();
+        // Cap the payload so a long-running install cannot stall the webview.
+        // The newest lines are the useful ones for diagnosing a drop.
+        const MAX: usize = 120_000;
+        if text.len() > MAX {
+            let mut start = text.len() - MAX;
+            while start < text.len() && !text.is_char_boundary(start) {
+                start += 1;
+            }
+            text = format!("… (truncated, showing the last {MAX} bytes)\n{}", &text[start..]);
+        }
+        out.insert(key.to_string(), serde_json::Value::String(text));
+    }
+    Ok(serde_json::Value::Object(out))
+}
+
+#[tauri::command]
+fn clear_logs() -> Result<(), String> {
+    let dir = dirs::config_dir()
+        .ok_or("no config dir")?
+        .join("lionray-vpn");
+    // Truncate, do not delete: xray / sing-box keep these files open, and on
+    // Windows a delete would leave them writing into an orphaned handle.
+    for name in ["app.log", "xray.log", "singbox.log"] {
+        let path = dir.join(name);
+        if path.exists() {
+            std::fs::write(&path, "").map_err(|e| format!("clear {name}: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn restart_app(app: tauri::AppHandle) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -3347,6 +3392,8 @@ pub fn run() {
             restart_app,
             rollback_xray_core,
             relaunch_as_admin,
+            read_logs,
+            clear_logs,
         ])
         .setup(|app| {
             // Heal stale state from a previous crash on a background thread:

@@ -78,7 +78,8 @@ const DEFAULT_SETTINGS: Settings = {
 
 const IS_WINDOWS = typeof navigator !== "undefined" && /Windows/i.test(navigator.userAgent);
 
-type Tab = "home" | "servers" | "subs" | "settings";
+type Tab = "home" | "servers" | "subs" | "settings" | "logs";
+type LogKind = "app" | "xray" | "singbox";
 type SheetMode = null | "menu" | "sub";
 
 const PROTO_COLORS: Record<string, string> = { vless: "#6366F1", trojan: "#F59E0B", shadowsocks: "#10B981" };
@@ -292,6 +293,9 @@ function App() {
   const [confirmDlg, setConfirmDlg] = useState<{ msg: string; onOk: () => void } | null>(null);
   const [bypassInput, setBypassInput] = useState("");
   const [appUpdate, setAppUpdate] = useState<string | null>(null);
+  const [logKind, setLogKind] = useState<LogKind>("app");
+  const [logs, setLogs] = useState<Record<LogKind, string>>({ app: "", xray: "", singbox: "" });
+  const [logBusy, setLogBusy] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -368,6 +372,47 @@ function App() {
     setToast({ msg, bad });
     setTimeout(() => setToast(null), 2600);
   }, []);
+
+  // ─── logs: read / refresh / clear from inside the app ───
+  const loadLogs = useCallback(async (silent = false) => {
+    if (!silent) setLogBusy(true);
+    try {
+      const data = await invoke<Record<string, string>>("read_logs");
+      setLogs({
+        app: data.app || "",
+        xray: data.xray || "",
+        singbox: data.singbox || "",
+      });
+    } catch (e) {
+      if (!silent) showToast(`Log ဖတ်လို့မရပါ: ${e}`, true);
+    } finally {
+      if (!silent) setLogBusy(false);
+    }
+  }, [showToast]);
+
+  const clearLogs = useCallback(() => {
+    setConfirmDlg({
+      msg: "Log အားလုံး (App / Xray / TUN) ကို ဖျက်မလား?\nဒါကနောက်ပြန်ရလို့မရပါဘူး။",
+      onOk: async () => {
+        setConfirmDlg(null);
+        try {
+          await invoke("clear_logs");
+          setLogs({ app: "", xray: "", singbox: "" });
+          showToast("Log တွေ ရှင်းပြီး ✅");
+        } catch (e) {
+          showToast(`Log ဖျက်လို့မရပါ: ${e}`, true);
+        }
+      },
+    });
+  }, [showToast]);
+
+  // Live-refresh while the Logs tab is open so a drop can be watched in real time.
+  useEffect(() => {
+    if (tab !== "logs") return;
+    void loadLogs(true);
+    const timer = setInterval(() => void loadLogs(true), 4000);
+    return () => clearInterval(timer);
+  }, [tab, loadLogs]);
 
   // ─── restart with UAC so TUN mode can create its adapter ───
   const requestAdmin = useCallback(() => {
@@ -1494,6 +1539,45 @@ function App() {
         </>
       )}
 
+      {tab === "logs" && (
+        <>
+          <header className="topbar">
+            <button className="back-btn" onClick={() => setTab("home")}>‹</button>
+            <span className="topbar-title">Logs</span>
+            <span style={{ width: 46 }} />
+          </header>
+          <div className="content">
+            <div className="log-tabs">
+              {([
+                ["app", "📱 App"],
+                ["xray", "🚀 Xray"],
+                ["singbox", "🛰️ TUN"],
+              ] as const).map(([id, label]) => (
+                <button
+                  key={id}
+                  className={`log-tab ${logKind === id ? "on" : ""}`}
+                  onClick={() => setLogKind(id)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            <div className="log-actions">
+              <button className="btn-secondary" onClick={() => void loadLogs()} disabled={logBusy}>
+                {logBusy ? "…" : "↻ Refresh"}
+              </button>
+              <button className="btn-secondary" onClick={clearLogs}>🗑 Clear All</button>
+            </div>
+            <div className="log-box">
+              <pre className="log-pre">{logs[logKind] || "(Log မရှိသေးပါ / empty)"}</pre>
+            </div>
+            <div className="hint">
+              Log ဖိုင်တွေ %APPDATA%\lionray-vpn ထဲမှာ ရှိပါတယ်။ Clear လုပ်ရင် ချိတ်ထားတဲ့ session ရဲ့ log တွေလည်း ပါသွားပါမယ်။
+            </div>
+          </div>
+        </>
+      )}
+
       {/* FAB */}
       {(tab === "servers" || tab === "subs") && (
         <button className="fab" onClick={() => setSheet(sheet === "menu" ? null : "menu")}>+</button>
@@ -1726,6 +1810,7 @@ function App() {
           ["home", "⏻", "Home"],
           ["servers", "📡", "Nodes"],
           ["subs", "🔗", "Subs"],
+          ["logs", "📋", "Logs"],
           ["settings", "⚙", "Settings"],
         ] as const).map(([id, icon, label]) => (
           <button key={id} className={`nav-btn ${tab === id ? "active" : ""}`} onClick={() => setTab(id)}>
