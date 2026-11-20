@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.11";
+pub const APP_VERSION: &str = "1.8.12";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -1408,40 +1408,40 @@ fn generate_tun_config(dns: &str, interface_name: &str, udp: bool, ipv6: bool) -
 #[cfg(target_os = "windows")]
 fn tun_captures_all() -> bool {
     let Ok(out) = std::process::Command::new("netsh")
-        .args(["interface", "ipv4", "show", "route", "-4"])
+        .args(["interface", "ipv4", "show", "route"])
         .output()
     else {
         return false;
     };
     let text = String::from_utf8_lossy(&out.stdout);
-    let mut best: Option<(i64, String)> = None; // metric, interface
+    let mut best: Option<i64> = None;
     for line in text.lines() {
         if !line.contains("0.0.0.0/0") {
             continue;
         }
         let cols: Vec<&str> = line.split_whitespace().collect();
-        if cols.len() < 4 {
+        if cols.len() < 6 {
             continue;
         }
-        // "  0.0.0.0/0     192.168.31.1   Wi-Fi          2"
-        let Ok(metric) = cols[3].parse::<i64>() else {
+        // cols[2] = Met, cols[5] = Gateway/Interface Name
+        let Ok(metric) = cols[2].parse::<i64>() else {
             continue;
         };
-        let interface = cols[2].to_ascii_lowercase();
-        if interface.contains("tun") {
+        let gw_or_iface = cols[5].to_ascii_lowercase();
+        if gw_or_iface.contains("tun") || gw_or_iface.starts_with("172.19.") {
             continue;
         }
-        if best.as_ref().map(|(m, _)| metric < *m).unwrap_or(true) {
-            best = Some((metric, interface));
+        if best.map(|m| metric < m).unwrap_or(true) {
+            best = Some(metric);
         }
     }
     match best {
-        Some((metric, _)) => {
-            app_log(&format!("TUN check: default route metric={metric} (ok)"));
+        Some(metric) => {
+            app_log(&format!("TUN check: non-tun default route metric={metric} (ok)"));
             true
         }
         None => {
-            app_log("TUN check: no usable default route for 0.0.0.0/0");
+            app_log("TUN check: no usable non-tun default route for 0.0.0.0/0");
             false
         }
     }
@@ -1524,23 +1524,25 @@ fn tunnel_host_route(server_ip: &str) {
     let Ok(out) = out else { return };
     let text = String::from_utf8_lossy(&out.stdout);
     let mut gw = String::new();
-    let mut iface = String::new();
     for line in text.lines() {
-        // "  0.0.0.0/0     192.168.31.1   Wi-Fi   2"
         if !line.contains("0.0.0.0/0") {
             continue;
         }
         let cols: Vec<&str> = line.split_whitespace().collect();
-        if cols.len() >= 4 {
-            // gateway is after the prefix, interface name is the 3rd column
-            let g = cols[1];
-            if !g.starts_with("10.") && !g.starts_with("192.168") && !g.starts_with("172.") {
-                continue;
-            }
-            gw = g.to_string();
-            iface = cols[2].to_string();
-            break;
+        // cols: Publish Type Met Prefix Idx Gateway/Interface
+        if cols.len() < 6 {
+            continue;
         }
+        let g = cols[5];
+        if !g.starts_with("10.") && !g.starts_with("192.168") && !g.starts_with("172.") {
+            continue;
+        }
+        // Skip tun adapter gateways
+        if g.starts_with("172.19.") {
+            continue;
+        }
+        gw = g.to_string();
+        break;
     }
     if gw.is_empty() {
         return;
@@ -1548,7 +1550,7 @@ fn tunnel_host_route(server_ip: &str) {
     let _ = std::fs::create_dir_all(tunnel_route_file().parent().unwrap());
     let _ = std::fs::write(
         tunnel_route_file(),
-        format!("{server_ip}\n{gw}\n{iface}\n"),
+        format!("{server_ip}\n{gw}\n"),
     );
     let _ = std::process::Command::new("route")
         .args(["add", server_ip, "mask", "255.255.255.255", &gw, "metric", "1"])
