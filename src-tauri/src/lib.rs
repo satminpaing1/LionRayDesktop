@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.21";
+pub const APP_VERSION: &str = "1.8.22";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -325,33 +325,6 @@ fn probe_urls_race_direct(urls: &[&str], secs: u64) -> bool {
         }
     }
     false
-}
-
-// End-to-end probe through the local SOCKS inbound. Detects a tunnel that is
-// "up" locally (xray alive, port listening) but cannot reach the internet —
-// the exact case the old watchdog could never see.
-fn probe_via_socks() -> bool {
-    probe_urls_race_socks(
-        &[
-            "http://www.gstatic.com/generate_204",
-            "http://cp.cloudflare.com/generate_204",
-            "http://www.msftconnecttest.com/connecttest.txt",
-        ],
-        6,
-    )
-}
-
-// In TUN mode all direct traffic is captured by the adapter, so a direct
-// request tests the whole sing-box -> xray path (routes, DNS, adapter).
-fn probe_direct() -> bool {
-    probe_urls_race_direct(
-        &[
-            "http://www.gstatic.com/generate_204",
-            "http://cp.cloudflare.com/generate_204",
-            "http://www.msftconnecttest.com/connecttest.txt",
-        ],
-        6,
-    )
 }
 
 // Pre-flight before enabling a machine-wide proxy/TUN. Plain HTTP endpoints
@@ -2581,7 +2554,7 @@ fn is_connected() -> bool {
     };
     if !core_alive {
         CONNECTED.store(false, Ordering::SeqCst);
-        app_log("core exited unexpectedly - watchdog will reconnect");
+        app_log("core exited unexpectedly - connect again to restore the tunnel");
         return false;
     }
     let tun_on = LAST
@@ -3413,118 +3386,12 @@ pub fn run() {
             #[cfg(windows)]
             std::thread::spawn(sweep_phantom_wintun);
 
-            // Self-healing watchdog. Detects three distinct failures:
-            //  * hard — xray / sing-box process exited
-            //  * soft — the local SOCKS port stopped accepting connections
-            //  * net  — process alive and port listening, but the tunnel cannot
-            //           carry traffic (this is what used to require a manual
-            //           reconnect after a drop)
-            // It never "gives up" while AUTO is set; it only backs off.
-            std::thread::spawn(|| {
-                let mut retries: u32 = 0;
-                let mut dead_streak: u32 = 0;
-                let mut probe_fail_streak: u32 = 0;
-                let mut tick: u32 = 0;
-                const DEAD_THRESHOLD: u32 = 5; // 5 * 5 s for soft failures
-                loop {
-                    std::thread::sleep(std::time::Duration::from_secs(5));
-                    tick = tick.wrapping_add(1);
-                    if !AUTO.load(Ordering::SeqCst) {
-                        retries = 0;
-                        dead_streak = 0;
-                        probe_fail_streak = 0;
-                        continue;
-                    }
-                    let child_alive = match CHILD.lock() {
-                        Ok(mut g) => match g.as_mut() {
-                            Some(c) => matches!(c.try_wait(), Ok(None)),
-                            None => false,
-                        },
-                        Err(_) => false,
-                    };
-                    let tun_needed = LAST
-                        .lock()
-                        .ok()
-                        .and_then(|g| g.as_ref().map(|l| l.tun))
-                        .unwrap_or(false);
-                    let hard_dead = !child_alive || (tun_needed && !tun_alive());
-                    let soft_dead = !hard_dead && !socks_listening();
-
-                    // End-to-end probe every 30 s. In TUN mode a direct request
-                    // traverses the adapter, so it tests the whole path.
-                    let mut net_dead = false;
-                    if !hard_dead && !soft_dead && tick % 24 == 0 {
-                        let ok = if tun_needed { probe_direct() } else { probe_via_socks() };
-                        if ok {
-                            probe_fail_streak = 0;
-                        } else {
-                            probe_fail_streak += 1;
-                            app_log(&format!(
-                                "watchdog: tunnel probe failed ({probe_fail_streak}/10)"
-                            ));
-                            net_dead = probe_fail_streak >= 10;
-                        }
-                    }
-
-                    // Do NOT re-enable the Windows proxy here. If the user (or
-                    // another app) turns it off, that is their choice; the old
-                    // "helpful" re-enable made Windows Settings look like the
-                    // VPN kept turning the proxy back on by itself.
-
-                    if !hard_dead && !soft_dead && !net_dead {
-                        retries = 0;
-                        dead_streak = 0;
-                        continue;
-                    }
-                    if !hard_dead && !net_dead {
-                        dead_streak += 1;
-                        if dead_streak < DEAD_THRESHOLD {
-                            continue;
-                        }
-                    }
-                    // Re-check intent right before reconnect: a manual
-                    // disconnect may have happened mid-tick.
-                    if !AUTO.load(Ordering::SeqCst) {
-                        retries = 0;
-                        dead_streak = 0;
-                        probe_fail_streak = 0;
-                        continue;
-                    }
-                    dead_streak = 0;
-                    probe_fail_streak = 0;
-
-                    let Some(l) = LAST.lock().ok().and_then(|g| g.clone()) else {
-                        app_log("watchdog: no saved connection - auto-reconnect stopped");
-                        reset_tunnel_state();
-                        AUTO.store(false, Ordering::SeqCst);
-                        continue;
-                    };
-                    retries = retries.saturating_add(1);
-                    app_log(&format!(
-                        "watchdog: reconnect attempt {retries} (hard={hard_dead} net={net_dead})"
-                    ));
-                    let ok = establish(
-                        &l.server, &l.routing, &l.dns, l.ad_block, &l.bypass, l.tun, l.udp,
-                        l.ipv6, l.fragment,
-                    )
-                    .is_ok();
-                    if ok {
-                        retries = 0;
-                        app_log("watchdog: reconnected");
-                        // let the new tunnel settle before the next probe
-                        std::thread::sleep(std::time::Duration::from_secs(15));
-                    } else {
-                        // Don't leave the OS pointing at a dead core while we
-                        // back off — every app would look offline.
-                        reset_tunnel_state();
-                        let backoff = if retries >= 6 { 60 } else { 15 };
-                        app_log(&format!(
-                            "watchdog: reconnect failed - next attempt in {backoff}s"
-                        ));
-                        std::thread::sleep(std::time::Duration::from_secs(backoff));
-                    }
-                }
-            });
+            // No background auto-reconnect watchdog. Older releases (1.8.x)
+            // probed the tunnel every few seconds and re-established it on any
+            // soft failure, which on a slow-but-healthy line caused the VPN to
+            // drop and reconnect by itself. This restores the calm v1.6.0
+            // behaviour: the connection stays up until the user disconnects or
+            // the core genuinely exits, and `is_connected()` reflects that.
             Ok(())
         })
         .build(tauri::generate_context!())
