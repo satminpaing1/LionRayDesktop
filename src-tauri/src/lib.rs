@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.30";
+pub const APP_VERSION: &str = "1.8.31";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -105,6 +105,10 @@ extern "system" {
 #[cfg(windows)]
 #[link(name = "wininet")]
 extern "system" {
+    // wininet.h defines `InternetSetOption` as a macro for the W/A variants;
+    // there is no plain `InternetSetOption` export to link against. We pass no
+    // strings, so the wide variant is fine on every Windows version we ship.
+    #[link_name = "InternetSetOptionW"]
     fn InternetSetOption(
         h_internet: *mut std::ffi::c_void,
         dw_option: u32,
