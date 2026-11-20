@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.17";
+pub const APP_VERSION: &str = "1.8.18";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -2035,6 +2035,29 @@ fn is_elevated() -> bool {
 }
 
 // Restart the app (used after xray core update so the new binary takes effect).
+// Roll back the xray core to the .bak files created during the last update.
+#[tauri::command]
+fn rollback_xray_core() -> Result<String, String> {
+    let bin_path = find_xray_binary()?;
+    let bundle_dir = bin_path.parent().ok_or("xray dir not found")?.to_path_buf();
+    let mut restored = false;
+    for name in ["xray.exe", "geoip.dat", "geosite.dat"] {
+        let bak = bundle_dir.join(format!("{}.bak", name));
+        let dst = bundle_dir.join(name);
+        if bak.exists() {
+            let _ = std::fs::remove_file(&dst);
+            std::fs::copy(&bak, &dst).map_err(|e| format!("restore {name}: {e}"))?;
+            restored = true;
+        }
+    }
+    let _ = std::fs::remove_file(bundle_dir.join("version.txt"));
+    if !restored {
+        return Err("No backup files found".into());
+    }
+    let ver = get_core_version_sync().unwrap_or_else(|_| "unknown".into());
+    Ok(ver)
+}
+
 #[tauri::command]
 async fn restart_app(app: tauri::AppHandle) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -3320,6 +3343,7 @@ pub fn run() {
             open_link,
             is_elevated,
             restart_app,
+            rollback_xray_core,
             relaunch_as_admin,
         ])
         .setup(|app| {
