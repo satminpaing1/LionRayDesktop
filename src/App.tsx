@@ -80,6 +80,7 @@ const IS_WINDOWS = typeof navigator !== "undefined" && /Windows/i.test(navigator
 
 type Tab = "home" | "servers" | "subs" | "settings" | "logs";
 type LogKind = "app" | "xray" | "singbox";
+type LogLevel = "all" | "warn" | "error";
 type SheetMode = null | "menu" | "sub";
 
 const PROTO_COLORS: Record<string, string> = { vless: "#6366F1", trojan: "#F59E0B", shadowsocks: "#10B981" };
@@ -306,6 +307,8 @@ function App() {
   const [logs, setLogs] = useState<Record<LogKind, string>>({ app: "", xray: "", singbox: "" });
   const [logBusy, setLogBusy] = useState(false);
   const [autoScroll, setAutoScroll] = useState(true);
+  const [logLevel, setLogLevel] = useState<LogLevel>("all");
+  const [logQuery, setLogQuery] = useState("");
   const logBoxRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -441,7 +444,7 @@ function App() {
     if (tab !== "logs" || !autoScroll) return;
     const box = logBoxRef.current;
     if (box) box.scrollTop = box.scrollHeight;
-  }, [logs, logKind, autoScroll, tab]);
+  }, [logs, logKind, logLevel, logQuery, autoScroll, tab]);
 
   const onLogScroll = useCallback(() => {
     const box = logBoxRef.current;
@@ -449,6 +452,25 @@ function App() {
     const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 48;
     setAutoScroll(atBottom);
   }, []);
+
+  // Only render what the user asked for. Capping the DOM keeps the console
+  // rock-steady instead of re-laying out thousands of lines every refresh.
+  const { shownLines, totalLines } = useMemo(() => {
+    const raw = logs[logKind];
+    if (!raw) return { shownLines: [] as { n: number; text: string; cls: string }[], totalLines: 0 };
+    const q = logQuery.trim().toLowerCase();
+    const all = raw.split("\n");
+    const picked: { n: number; text: string; cls: string }[] = [];
+    for (let i = 0; i < all.length; i++) {
+      const text = all[i].replace(/\u001b\[[0-9;?]*[A-Za-z]/g, "");
+      const cls = logLineClass(text);
+      if (logLevel === "error" && cls !== "err") continue;
+      if (logLevel === "warn" && cls !== "err" && cls !== "warn") continue;
+      if (q && !text.toLowerCase().includes(q)) continue;
+      picked.push({ n: i + 1, text, cls });
+    }
+    return { shownLines: picked.slice(-500), totalLines: picked.length };
+  }, [logs, logKind, logLevel, logQuery]);
 
   // ─── restart with UAC so TUN mode can create its adapter ───
   const requestAdmin = useCallback(() => {
@@ -1605,11 +1627,40 @@ function App() {
                 <button className="log-ico-btn danger" onClick={clearLogs} title="Clear all logs">🗑</button>
               </div>
             </div>
+            <div className="log-filters">
+              <div className="log-levels">
+                {([
+                  ["all", "All"],
+                  ["warn", "⚠ Warn+"],
+                  ["error", "⛔ Error"],
+                ] as const).map(([id, label]) => (
+                  <button
+                    key={id}
+                    className={`log-level ${logLevel === id ? "on" : ""}`}
+                    onClick={() => setLogLevel(id)}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <div className="log-search">
+                <span>🔍</span>
+                <input
+                  value={logQuery}
+                  onChange={(e) => setLogQuery(e.target.value)}
+                  placeholder="Search log…"
+                  spellCheck={false}
+                />
+                {logQuery && (
+                  <button onClick={() => setLogQuery("")} title="Clear search">×</button>
+                )}
+              </div>
+            </div>
             <div className="log-meta">
               <span className="live-dot" />
               <span>LIVE · 4s</span>
               <span className="log-meta-dot">•</span>
-              <span>{logs[logKind] ? logs[logKind].split("\n").length.toLocaleString() : 0} lines</span>
+              <span>{totalLines.toLocaleString()} / {logs[logKind] ? logs[logKind].split("\n").length.toLocaleString() : 0} lines</span>
               <button
                 className={`log-autoscroll ${autoScroll ? "on" : ""}`}
                 onClick={() => setAutoScroll(!autoScroll)}
@@ -1618,17 +1669,29 @@ function App() {
               </button>
             </div>
             <div className="log-box" ref={logBoxRef} onScroll={onLogScroll}>
-              {logs[logKind] ? (
-                <pre className="log-pre">
-                  {logs[logKind].split("\n").map((line, i) => (
-                    <div key={i} className={`log-line ${logLineClass(line)}`}>{line || "\u00a0"}</div>
-                  ))}
-                </pre>
+              {shownLines.length ? (
+                <>
+                  {totalLines > shownLines.length && (
+                    <div className="log-cap">နောက်ဆုံး {shownLines.length} ကြောင်းပဲ ပြထားပါတယ် ({totalLines} ထဲမှ)</div>
+                  )}
+                  <pre className="log-pre">
+                    {shownLines.map((l) => (
+                      <div key={l.n} className={`log-line ${l.cls}`}>
+                        <span className="log-no">{l.n}</span>
+                        <span className="log-txt">{l.text || "\u00a0"}</span>
+                      </div>
+                    ))}
+                  </pre>
+                </>
               ) : (
                 <div className="log-empty">
-                  <span>📋</span>
-                  <p>Log မရှိသေးပါ</p>
-                  <small>ချိတ်ဆက်ပြီးရင် ဒီမှာ အလိုအလျောက် ပေါ်လာပါမယ်</small>
+                  <span>{logLevel !== "all" || logQuery ? "🔍" : "📋"}</span>
+                  <p>{logLevel !== "all" || logQuery ? "မကိုက်ညီတဲ့ log မရှိပါ" : "Log မရှိသေးပါ"}</p>
+                  <small>
+                    {logLevel !== "all" || logQuery
+                      ? "Filter ကို All ပြန်ပြောင်းပြီး ကြည့်ပါ"
+                      : "ချိတ်ဆက်ပြီးရင် ဒီမှာ အလိုအလျောက် ပေါ်လာပါမယ်"}
+                  </small>
                 </div>
               )}
             </div>

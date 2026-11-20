@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.25";
+pub const APP_VERSION: &str = "1.8.26";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -1286,11 +1286,72 @@ fn find_singbox_binary() -> Result<std::path::PathBuf, String> {
     Err("sing-box binary not found — TUN mode needs sing-box.exe in xray-bundle-win".into())
 }
 
-// TUN front-end config: sing-box owns the virtual adapter + default routes,
-// then hands every connection to the existing Xray SOCKS listener. Xray keeps
-// doing all protocol work, routing rules, ad blocking and stats, so TUN and
-// proxy mode behave identically from the app's point of view.
+// TUN front-end config. sing-box owns the virtual adapter + default routes.
+// When the selected server is a plain VLESS/WS (or gRPC) account, sing-box
+// dials it DIRECTLY instead of going through Xray's local SOCKS port. That
+// removes the 127.0.0.1:10808 hop where Windows could hit WSAEADDRINUSE
+// ("Only one usage of each socket address") under bursty traffic, and makes
+// TUN noticeably faster. Unsupported protocols keep the old SOCKS bridge.
+fn tun_direct_outbound(server: &Server) -> Option<Value> {
+    if !server.protocol.eq_ignore_ascii_case("vless") || server.uuid.trim().is_empty() {
+        return None;
+    }
+    let sec = server.security.to_ascii_lowercase();
+    if !sec.is_empty() && sec != "tls" && sec != "none" {
+        return None; // reality etc. stay with Xray
+    }
+    let mut out = json!({
+        "type": "vless",
+        "tag": "proxy",
+        "server": server.address,
+        "server_port": server.port,
+        "uuid": server.uuid,
+    });
+    if sec == "tls" {
+        let sni = if server.sni.is_empty() { server.address.clone() } else { server.sni.clone() };
+        let mut tls = json!({ "enabled": true, "server_name": sni });
+        if server.allow_insecure {
+            tls["insecure"] = json!(true);
+        }
+        let fp = if server.fingerprint.is_empty() { "chrome" } else { server.fingerprint.as_str() };
+        tls["utls"] = json!({ "enabled": true, "fingerprint": fp });
+        out["tls"] = tls;
+    }
+    match server.network.to_ascii_lowercase().as_str() {
+        "ws" | "websocket" | "" => {
+            let path = if server.ws_path.is_empty() { "/" } else { server.ws_path.as_str() };
+            let mut ws = json!({ "type": "ws", "path": path });
+            if !server.ws_host.is_empty() {
+                ws["headers"] = json!({ "Host": server.ws_host });
+            }
+            if path.contains("ed=") {
+                ws["early_data_header_name"] = json!("Sec-WebSocket-Protocol");
+            }
+            out["transport"] = ws;
+        }
+        "grpc" => {
+            let mut grpc = json!({ "type": "grpc" });
+            if !server.grpc_service_name.is_empty() {
+                grpc["service_name"] = json!(server.grpc_service_name);
+            }
+            out["transport"] = grpc;
+        }
+        _ => return None, // h2/httpupgrade/quic stay with Xray
+    }
+    Some(out)
+}
+
 fn generate_tun_config(dns: &str, interface_name: &str, udp: bool, ipv6: bool) -> String {
+    generate_tun_config_for(dns, interface_name, udp, ipv6, None)
+}
+
+fn generate_tun_config_for(
+    dns: &str,
+    interface_name: &str,
+    udp: bool,
+    ipv6: bool,
+    server: Option<&Server>,
+) -> String {
     // Resolve DNS through the tunnel with DoH so queries can never leak to the
     // local ISP resolver while the TUN adapter is default route.
     let (dns_ip, dns_name) = match dns {
@@ -1330,8 +1391,21 @@ fn generate_tun_config(dns: &str, interface_name: &str, udp: bool, ipv6: bool) -
         json!({ "action": "route", "outbound": "proxy" }),
     ]);
 
+    // warn keeps the log useful instead of flooding it with one line per
+    // connection; real errors still land in singbox.log for the in-app viewer.
+    let proxy_outbound = server
+        .and_then(tun_direct_outbound)
+        .unwrap_or_else(|| json!({
+            "type": "socks",
+            "tag": "proxy",
+            "server": "127.0.0.1",
+            "server_port": SOCKS_PORT,
+            "version": "5",
+            "udp_over_tcp": false
+        }));
+
     let config = json!({
-        "log": { "level": "info", "timestamp": true },
+        "log": { "level": "warn", "timestamp": true },
         "dns": {
             "servers": [{
                 "type": "https",
@@ -1357,17 +1431,7 @@ fn generate_tun_config(dns: &str, interface_name: &str, udp: bool, ipv6: bool) -
             "stack": "mixed",
             "dns_mode": "hijack"
         }],
-        "outbounds": [
-            {
-                "type": "socks",
-                "tag": "proxy",
-                "server": "127.0.0.1",
-                "server_port": SOCKS_PORT,
-                "version": "5",
-                "udp_over_tcp": false
-            },
-            { "type": "direct", "tag": "direct" }
-        ],
+        "outbounds": [proxy_outbound, { "type": "direct", "tag": "direct" }],
         "route": {
             "auto_detect_interface": true,
             // never fall back to the system resolver (which points back into
@@ -1576,10 +1640,10 @@ fn sweep_phantom_wintun() {
     let _ = cmd.output();
 }
 
-fn start_tun(dns: &str, udp: bool, ipv6: bool) -> Result<(), String> {
+fn start_tun(dns: &str, udp: bool, ipv6: bool, server: &Server) -> Result<(), String> {
     #[cfg(not(windows))]
     {
-        let _ = (dns, udp, ipv6);
+        let _ = (dns, udp, ipv6, server);
         Err("TUN mode is only supported on Windows".into())
     }
     #[cfg(windows)]
@@ -1601,8 +1665,11 @@ fn start_tun(dns: &str, udp: bool, ipv6: bool) -> Result<(), String> {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         let interface_name = format!("LionRayTun{}{}", std::process::id() % 1000, seed % 100000);
-        std::fs::write(&config_path, generate_tun_config(dns, &interface_name, udp, ipv6))
-            .map_err(|e| e.to_string())?;
+        std::fs::write(
+            &config_path,
+            generate_tun_config_for(dns, &interface_name, udp, ipv6, Some(server)),
+        )
+        .map_err(|e| e.to_string())?;
 
         let mut cmd = std::process::Command::new(&path);
         cmd.args(["run", "-c"]).arg(&config_path).current_dir(&config_dir);
@@ -2038,6 +2105,26 @@ fn rollback_xray_core() -> Result<String, String> {
     Ok(ver)
 }
 
+// sing-box writes ANSI colour escapes even into its log file. They are noise
+// in a webview (and in copied text), so strip them before returning to the UI.
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut it = input.chars().peekable();
+    while let Some(c) = it.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        while let Some(&next) = it.peek() {
+            it.next();
+            if ('@'..='~').contains(&next) {
+                break;
+            }
+        }
+    }
+    out
+}
+
 // Logs live in %APPDATA%\lionray-vpn. Expose them to the UI so the user can
 // inspect what happened without hunting for files in Explorer.
 #[tauri::command]
@@ -2051,7 +2138,7 @@ fn read_logs() -> Result<serde_json::Value, String> {
         ("xray", "xray.log"),
         ("singbox", "singbox.log"),
     ] {
-        let mut text = std::fs::read_to_string(dir.join(name)).unwrap_or_default();
+        let mut text = strip_ansi(&std::fs::read_to_string(dir.join(name)).unwrap_or_default());
         // Cap the payload so a long-running install cannot stall the webview.
         // The newest lines are the useful ones for diagnosing a drop.
         const MAX: usize = 120_000;
@@ -2424,7 +2511,10 @@ fn establish(
     }
 
     if tun {
-        if let Err(e) = start_tun(dns, udp, ipv6) {
+        // Keep the server reachable outside the tunnel BEFORE sing-box starts:
+        // its direct VLESS dial must never be swallowed by its own TUN route.
+        tunnel_host_route(&dial_server.address);
+        if let Err(e) = start_tun(dns, udp, ipv6, &dial_server) {
             // roll back xray so a failed TUN start cannot leave a half state
             if let Ok(mut g) = CHILD.lock() {
                 if let Some(mut c) = g.take() {
@@ -2432,12 +2522,12 @@ fn establish(
                     let _ = c.wait();
                 }
             }
+            clear_tunnel_host_route();
             CONNECTED.store(false, Ordering::SeqCst);
             return Err(e);
         }
-        // keep the proxy server reachable outside the tunnel: Xray must dial
-        // the real IP directly, not through the TUN adapter sing-box owns
-        tunnel_host_route(&dial_server.address);
+        // The /32 host route above keeps the server IP on the physical gateway
+        // even after sing-box installs its 0.0.0.0/0 TUN route.
         // TUN captures everything; a manual proxy or a foreign PAC on top
         // would double-route traffic and can blackhole the machine.
         take_over_proxy(false);
@@ -3585,6 +3675,50 @@ mod tests {
             .unwrap()
             .iter()
             .any(|r| r["network"] == "udp"));
+    }
+
+    #[test]
+    fn tun_uses_direct_vless_instead_of_local_socks() {
+        let mut s = user_server();
+        s.address = "172.66.44.95".into();
+        s.port = 443;
+        s.protocol = "vless".into();
+        s.network = "ws".into();
+        s.security = "tls".into();
+        s.sni = "smpss.liondigitalstore.nya.je".into();
+        s.ws_host = s.sni.clone();
+        s.ws_path = "/?ed=2560".into();
+        s.uuid = "5f487d99-05c7-4f7c-8b18-987c247d716e".into();
+
+        let cfg: Value = serde_json::from_str(&generate_tun_config_for(
+            "system", "LionRayTunTest", false, false, Some(&s),
+        ))
+        .unwrap();
+        let proxy = cfg["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["tag"] == "proxy")
+            .unwrap();
+        assert_eq!(proxy["type"], "vless");
+        assert_eq!(proxy["server"], "172.66.44.95");
+        assert_eq!(proxy["transport"]["type"], "ws");
+        assert_eq!(proxy["transport"]["early_data_header_name"], "Sec-WebSocket-Protocol");
+        assert_eq!(proxy["tls"]["server_name"], "smpss.liondigitalstore.nya.je");
+
+        // Unknown protocol must keep the safe local SOCKS bridge.
+        s.protocol = "trojan".into();
+        let cfg2: Value = serde_json::from_str(&generate_tun_config_for(
+            "system", "LionRayTunTest", false, false, Some(&s),
+        ))
+        .unwrap();
+        let proxy2 = cfg2["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["tag"] == "proxy")
+            .unwrap();
+        assert_eq!(proxy2["type"], "socks");
     }
 
     #[test]
