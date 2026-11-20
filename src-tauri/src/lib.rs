@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.9";
+pub const APP_VERSION: &str = "1.8.10";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -368,13 +368,14 @@ fn verify_tunnel_ready() -> bool {
 }
 
 fn verify_tun_ready() -> bool {
+    // TUN/DNS/route setup can take a few seconds after the adapter appears.
     probe_urls_race_direct(
         &[
             "http://cp.cloudflare.com/generate_204",
             "http://www.gstatic.com/generate_204",
             "http://www.msftconnecttest.com/connecttest.txt",
         ],
-        4,
+        10,
     )
 }
 
@@ -2337,6 +2338,9 @@ fn establish(
         // TUN captures everything; a manual proxy or a foreign PAC on top
         // would double-route traffic and can blackhole the machine.
         take_over_proxy(false);
+
+        // Give routes/DNS a moment to settle before the first probe.
+        std::thread::sleep(std::time::Duration::from_millis(800));
 
         // Verify the adapter actually carries traffic; roll back instead of
         // leaving every app offline behind a broken TUN.
