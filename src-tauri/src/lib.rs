@@ -39,6 +39,11 @@ static DL_PROGRESS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32:
 // Startup stale-state cleanup runs on a background thread so the window can
 // paint immediately. `connect` waits for it (short, bounded) before establishing.
 static STARTUP_CLEANUP_DONE: AtomicBool = AtomicBool::new(false);
+// True from the first moment a connect is in flight until it succeeds/fails.
+// The startup thread uses it to avoid restoring the proxy on top of a connect.
+static CONNECTING: AtomicBool = AtomicBool::new(false);
+// Serializes every read-modify-write of the Windows proxy registry values.
+static PROXY_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -1752,6 +1757,12 @@ fn reg_is_on(name: &str) -> bool {
 
 #[cfg(target_os = "windows")]
 fn restore_proxy() {
+    let _guard = PROXY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    restore_proxy_win();
+}
+
+#[cfg(target_os = "windows")]
+fn restore_proxy_win() {
     let Some(path) = proxy_backup_path() else { return };
     let backup: Option<ProxyBackup> = std::fs::read_to_string(&path)
         .ok()
@@ -1817,15 +1828,8 @@ fn restore_proxy() {
 fn take_over_proxy(on: bool) {
     #[cfg(target_os = "windows")]
     {
-        save_proxy_backup();
-        if on {
-            reg_set_value("ProxyServer", "REG_SZ", &format!("127.0.0.1:{HTTP_PORT}"));
-            reg_set_value("ProxyEnable", "REG_DWORD", "1");
-        } else {
-            reg_set_value("ProxyEnable", "REG_DWORD", "0");
-        }
-        reg_delete_value("AutoConfigURL");
-        reg_set_value("AutoDetect", "REG_DWORD", "0");
+        let _guard = PROXY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        take_over_proxy_win(on);
     }
     #[cfg(target_os = "macos")]
     {
@@ -1864,6 +1868,19 @@ fn take_over_proxy(on: bool) {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn take_over_proxy_win(on: bool) {
+    save_proxy_backup();
+    if on {
+        reg_set_value("ProxyServer", "REG_SZ", &format!("127.0.0.1:{HTTP_PORT}"));
+        reg_set_value("ProxyEnable", "REG_DWORD", "1");
+    } else {
+        reg_set_value("ProxyEnable", "REG_DWORD", "0");
+    }
+    reg_delete_value("AutoConfigURL");
+    reg_set_value("AutoDetect", "REG_DWORD", "0");
+}
+
 // A PAC script pointing at a local port where nothing is listening (left by
 // another VPN/proxy client, or by an old LionRay build) makes Windows send every
 // request to a dead endpoint. It overrides the manual proxy, so the machine
@@ -1887,11 +1904,17 @@ fn clear_dead_local_pac() {
 // actually connected is never disturbed.
 #[cfg(target_os = "windows")]
 fn restore_stale_proxy() {
+    // Same lock as connect's takeover, so the two can never interleave and
+    // leave the proxy disabled behind a connection the UI already shows as up.
+    let _guard = PROXY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_dead_local_pac();
+    if CONNECTING.load(Ordering::SeqCst) {
+        return;
+    }
     if socks_listening() {
         return;
     }
-    restore_proxy();
+    restore_proxy_win();
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -2339,6 +2362,8 @@ async fn connect(
 
     let srv = server.clone();
     let (r2, d2, bp2) = (r.clone(), d.clone(), bp.clone());
+    // Tells the startup thread not to restore the proxy underneath us.
+    CONNECTING.store(true, Ordering::SeqCst);
     let started = tokio::task::spawn_blocking(move || {
         // Never let the startup cleanup thread clear the proxy we are about to
         // enable. It normally finishes in <100 ms, so this is effectively free.
@@ -2352,8 +2377,9 @@ async fn connect(
             &srv, &r2, &d2, ab, &bp2, tun_on, udp_on, ipv6_on, fragment_on,
         )
     })
-    .await
-    .map_err(|e| format!("connect task failed: {e}"))?;
+    .await;
+    CONNECTING.store(false, Ordering::SeqCst);
+    let started = started.map_err(|e| format!("connect task failed: {e}"))?;
 
     if let Err(e) = started {
         app_log(&format!("connect failed: {e}"));
