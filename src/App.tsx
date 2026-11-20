@@ -623,9 +623,9 @@ function App() {
     };
   }, [connected]);
 
-  // Background connection heartbeat. The Rust watchdog owns reconnection, so
-  // this only mirrors its state: calling connect() here as well would race the
-  // watchdog and could spawn two cores / two TUN adapters.
+  // Background connection heartbeat. The backend repairs Windows networking
+  // immediately when the core/TUN dies but never reconnects by itself, so this
+  // only mirrors its state and tells the user to tap Connect when ready.
   useEffect(() => {
     let last: boolean | null = null;
     const heartbeat = setInterval(async () => {
@@ -634,7 +634,7 @@ function App() {
         const alive = await invoke<boolean>("is_connected");
         if (manualDisconnectRef.current) return;
         if (last !== null && last !== alive) {
-          showToast(alive ? "Reconnected ✓" : "Connection lost — reconnecting…", !alive);
+          showToast(alive ? "Connected ✓" : "Connection lost — network restored, tap Connect to retry", !alive);
         }
         last = alive;
         setConnected(alive);
