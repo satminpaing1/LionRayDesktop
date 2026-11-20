@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.12";
+pub const APP_VERSION: &str = "1.8.13";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -361,9 +361,8 @@ fn verify_tunnel_ready() -> bool {
         &[
             "http://cp.cloudflare.com/generate_204",
             "http://www.gstatic.com/generate_204",
-            "http://www.msftconnecttest.com/connecttest.txt",
         ],
-        4,
+        2,
     )
 }
 
@@ -373,9 +372,8 @@ fn verify_tun_ready() -> bool {
         &[
             "http://cp.cloudflare.com/generate_204",
             "http://www.gstatic.com/generate_204",
-            "http://www.msftconnecttest.com/connecttest.txt",
         ],
-        10,
+        6,
     )
 }
 
@@ -1652,7 +1650,7 @@ fn start_tun(dns: &str, udp: bool, ipv6: bool) -> Result<(), String> {
 
         // adapter creation + route programming takes a moment; fail fast if
         // Windows refused (usually because the process is not elevated)
-        std::thread::sleep(std::time::Duration::from_millis(1500));
+        std::thread::sleep(std::time::Duration::from_millis(1000));
         if !tun_alive() {
             stop_tun();
             return Err("TUN engine exited immediately — administrator rights are required".into());
@@ -2314,7 +2312,7 @@ fn establish(
     let mut ready = false;
     // 25 ms granularity instead of 100 ms: the core is usually listening in
     // ~50 ms, so the old loop wasted ~75-100 ms on every single connect.
-    for _ in 0..200 {
+    for _ in 0..100 {
         std::thread::sleep(std::time::Duration::from_millis(25));
         let alive = {
             let mut guard = CHILD.lock().map_err(|e| e.to_string())?;
@@ -2379,7 +2377,7 @@ fn establish(
         take_over_proxy(false);
 
         // Give routes/DNS a moment to settle before the check.
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::thread::sleep(std::time::Duration::from_millis(300));
 
         // Verify the adapter actually captures traffic (a valid non-tun
         // default route); if not, fall back to proxy mode so the user is not
@@ -2394,7 +2392,7 @@ fn establish(
                     "http://cp.cloudflare.com/generate_204",
                     "http://www.gstatic.com/generate_204",
                 ],
-                5,
+                3,
             );
         }
         if tun_effective {

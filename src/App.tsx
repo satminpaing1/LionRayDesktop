@@ -511,7 +511,7 @@ function App() {
         .catch(() => {})
         .finally(() => { exitBusy = false; });
     };
-    const first = setTimeout(check, 700);
+    const first = setTimeout(check, 300);
     const poll = setInterval(check, 20000);
 
     return () => {
