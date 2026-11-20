@@ -1107,61 +1107,91 @@ function App() {
       {/* ═══════════ HOME ═══════════ */}
       {tab === "home" && (
         <>
-          <header className="topbar">
-            <span className="logo">🦁 LionRay</span>
+          <header className="topbar home-top">
+            <div className="brand">
+              <div className="brand-mark">🦁</div>
+              <div className="brand-text">
+                <span className="logo">LionRay</span>
+                <small>VPN · SECURE TUNNEL</small>
+              </div>
+            </div>
             <RoutingIcon />
           </header>
 
-          {/* node card */}
-          <div className={`node-card ${connected ? "live" : ""}`} onClick={() => setTab("servers")}>
-            <div className="node-left">
-              <div className="node-name">
-                {connected && exitInfo?.countryCode && (
-                  <span className="node-flag">{flagEmoji(exitInfo.countryCode)}</span>
-                )}
-                {activeServer ? activeServer.name : "Select a node"}
+          <div className="home-body">
+            <div className="home-greeting">
+              <span>{connected ? "🛡️" : "👋"}</span>
+              <div>
+                <b>{connected ? "You're protected" : "Ready when you are"}</b>
+                <small>
+                  {connected
+                    ? "Your traffic is routed securely"
+                    : "Pick a node, then tap connect"}
+                </small>
               </div>
-              <div className="node-meta">
-                {activeServer ? `****:${activeServer.port}` : "Tap here or + to add"}
-              </div>
-            </div>
-            <div className="node-right" style={{ color: pingColor(activeServer?.ping ?? null) }}>
-              {activeServer?.ping != null && activeServer.ping >= 0 ? `${activeServer.ping}ms` : ""}
-              <span className="node-arrow">›</span>
-            </div>
-          </div>
-
-          {/* power button */}
-          <div className="power-zone">
-            <div className="power-wrap">
-              {connected && <div className="ring r1" />}
-              {connected && <div className="ring r2" />}
-              <button className={`power ${connected ? "on" : ""}`} disabled={busy} onClick={toggleConnect}>
-                {busy ? <span className="power-busy">…</span> : connected ? "⏹" : "▶"}
-              </button>
-            </div>
-            <div className={`power-state ${connected ? "on" : ""}`}>
-              {connected ? "CONNECTED" : "NOT CONNECTED"}
-            </div>
-            <div className="power-sub">
-              {connected
-                ? settings.tunMode
-                  ? "TUN active — all PC traffic"
-                  : "VPN tunnel active"
-                : settings.autoConnect
-                  ? "Auto-connect enabled"
-                  : "Tap the button to connect"}
             </div>
 
-            {connected && <LiveStats />}
-
-            {connected && exitInfo?.query && (
-              <div className="exit-chip" title={exitInfo.isp || ""}>
-                <span className="exit-flag">{flagEmoji(exitInfo.countryCode)}</span>
-                <b>{exitInfo.query}</b>
-                <span className="exit-loc">{[exitInfo.city, exitInfo.country].filter(Boolean).join(", ")}</span>
+            {/* node card */}
+            <div className={`node-card ${connected ? "live" : ""}`} onClick={() => setTab("servers")}>
+              <div className="node-avatar">
+                {activeServer && connected && exitInfo?.countryCode
+                  ? flagEmoji(exitInfo.countryCode)
+                  : "🌐"}
               </div>
-            )}
+              <div className="node-left">
+                <div className="node-name">
+                  {activeServer ? activeServer.name : "Select a node"}
+                </div>
+                <div className="node-meta">
+                  {activeServer
+                    ? `${activeServer.protocol.toUpperCase()} · ****:${activeServer.port}`
+                    : "Tap here or + to add"}
+                </div>
+              </div>
+              <div className="node-right" style={{ color: pingColor(activeServer?.ping ?? null) }}>
+                {activeServer?.ping != null && activeServer.ping >= 0 ? `${activeServer.ping}ms` : ""}
+                <span className="node-arrow">›</span>
+              </div>
+            </div>
+
+            {/* power hero */}
+            <div className={`power-zone ${connected ? "is-on" : ""}`}>
+              <div className="hero-orb a" />
+              <div className="hero-orb b" />
+              <div className="status-pill">
+                <span className="status-dot" />
+                {connected ? "PROTECTED" : "UNPROTECTED"}
+              </div>
+              <div className="power-wrap">
+                {connected && <div className="ring r1" />}
+                {connected && <div className="ring r2" />}
+                <button className={`power ${connected ? "on" : ""}`} disabled={busy} onClick={toggleConnect}>
+                  {busy ? <span className="power-busy">…</span> : connected ? "⏹" : "▶"}
+                </button>
+              </div>
+              <div className={`power-state ${connected ? "on" : ""}`}>
+                {connected ? "CONNECTED" : "NOT CONNECTED"}
+              </div>
+              <div className="power-sub">
+                {connected
+                  ? settings.tunMode
+                    ? "TUN active — all PC traffic"
+                    : "VPN tunnel active"
+                  : settings.autoConnect
+                    ? "Auto-connect enabled"
+                    : "Tap the button to connect"}
+              </div>
+
+              {connected && <LiveStats />}
+
+              {connected && exitInfo?.query && (
+                <div className="exit-chip" title={exitInfo.isp || ""}>
+                  <span className="exit-flag">{flagEmoji(exitInfo.countryCode)}</span>
+                  <b>{exitInfo.query}</b>
+                  <span className="exit-loc">{[exitInfo.city, exitInfo.country].filter(Boolean).join(", ")}</span>
+                </div>
+              )}
+            </div>
           </div>
         </>
       )}

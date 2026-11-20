@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.27";
+pub const APP_VERSION: &str = "1.8.28";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -16,6 +16,9 @@ static TUN_CHILD: Mutex<Option<std::process::Child>> = Mutex::new(None);
 // connect skip the pointless `reg delete HKLM\...\sing-box_tun` process spawn.
 static TUN_DIRTY: AtomicBool = AtomicBool::new(false);
 static CONNECTED: AtomicBool = AtomicBool::new(false);
+// A drop must restore Windows networking exactly once, even if the webview and
+// the native keep-warm thread notice it at the same moment.
+static NET_REPAIRING: AtomicBool = AtomicBool::new(false);
 // user intent to stay connected — gates the auto-reconnect watchdog so a manual
 // disconnect is never "repaired" by an unwanted auto-reconnect
 static AUTO: AtomicBool = AtomicBool::new(false);
@@ -92,7 +95,39 @@ fn hide_window(cmd: &mut std::process::Command) {
 #[cfg(windows)]
 extern "system" {
     fn SetThreadExecutionState(es_flags: u32) -> u32;
+    // Registry-only proxy changes are cached by WinINET/Chrome until a system
+    // notification arrives. That is why "reboot fixes the internet" after a
+    // drop. Broadcast the change so every app picks it up immediately.
+    fn InternetSetOption(
+        h_internet: *mut std::ffi::c_void,
+        dw_option: u32,
+        lp_buffer: *mut std::ffi::c_void,
+        dw_buffer_length: u32,
+    ) -> i32;
 }
+
+#[cfg(windows)]
+fn refresh_system_proxy() {
+    const INTERNET_OPTION_SETTINGS_CHANGED: u32 = 39;
+    const INTERNET_OPTION_REFRESH: u32 = 37;
+    unsafe {
+        InternetSetOption(
+            std::ptr::null_mut(),
+            INTERNET_OPTION_SETTINGS_CHANGED,
+            std::ptr::null_mut(),
+            0,
+        );
+        InternetSetOption(
+            std::ptr::null_mut(),
+            INTERNET_OPTION_REFRESH,
+            std::ptr::null_mut(),
+            0,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn refresh_system_proxy() {}
 
 #[cfg(windows)]
 fn set_keep_awake(on: bool) {
@@ -125,6 +160,19 @@ fn start_tunnel_keepalive() {
         loop {
             std::thread::sleep(std::time::Duration::from_secs(20));
             if !CONNECTED.load(Ordering::SeqCst) || CONNECTING.load(Ordering::SeqCst) {
+                continue;
+            }
+            // Also watch core/TUN health here: when the window is minimized the
+            // webview heartbeat is throttled, so this native loop is the one
+            // that still notices a drop and repairs the machine in time.
+            if !core_is_alive() {
+                CONNECTED.store(false, Ordering::SeqCst);
+                spawn_network_repair("core exit (keep-warm)");
+                continue;
+            }
+            if tunnel_mode_is_tun() && !tun_alive() {
+                CONNECTED.store(false, Ordering::SeqCst);
+                spawn_network_repair("TUN exit (keep-warm)");
                 continue;
             }
             let tun_on = TUN_CHILD.lock().map(|g| g.is_some()).unwrap_or(false);
@@ -1538,6 +1586,23 @@ fn tun_alive() -> bool {
     }
 }
 
+fn core_is_alive() -> bool {
+    match CHILD.lock() {
+        Ok(mut g) => match g.as_mut() {
+            Some(c) => matches!(c.try_wait(), Ok(None)),
+            None => false,
+        },
+        Err(_) => false,
+    }
+}
+
+fn tunnel_mode_is_tun() -> bool {
+    LAST.lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|l| l.tun))
+        .unwrap_or(false)
+}
+
 #[cfg(target_os = "windows")]
 const TUN_ROOT_KEY: &str = r"HKLM\SYSTEM\CurrentControlSet\Control\Network\sing-box_tun";
 
@@ -1984,6 +2049,7 @@ fn restore_proxy_win() {
             let _ = std::fs::remove_file(&path);
         }
     }
+    refresh_system_proxy();
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -2050,6 +2116,7 @@ fn take_over_proxy_win(on: bool) {
     }
     reg_delete_value("AutoConfigURL");
     reg_set_value("AutoDetect", "REG_DWORD", "0");
+    refresh_system_proxy();
 }
 
 // A PAC script pointing at a local port where nothing is listening (left by
@@ -2066,6 +2133,7 @@ fn clear_dead_local_pac() {
     }
     app_log("startup: removed dead local PAC (it would blackhole all browsing)");
     reg_delete_value("AutoConfigURL");
+    refresh_system_proxy();
 }
 
 // A crash, an installer upgrade, or a force-killed core can leave the Windows
@@ -2617,7 +2685,14 @@ async fn connect(
     fragment: Option<bool>,
 ) -> Result<String, String> {
     if CONNECTED.load(Ordering::SeqCst) {
-        return Err("Already connected — disconnect first".into());
+        // A core can die while the webview is throttled and leave CONNECTED
+        // stale. Repair it here instead of trapping the user in "already
+        // connected" with a machine that has no internet.
+        if !core_is_alive() || (tunnel_mode_is_tun() && !tun_alive()) {
+            repair_network_after_drop("stale state at connect");
+        } else {
+            return Err("Already connected — disconnect first".into());
+        }
     }
 
     let tun_on = tun.unwrap_or(false);
@@ -2638,6 +2713,15 @@ async fn connect(
     // Tells the startup thread not to restore the proxy underneath us.
     CONNECTING.store(true, Ordering::SeqCst);
     let started = tokio::task::spawn_blocking(move || {
+        // Let a drop-repair finish first. Otherwise its restore_proxy() could
+        // land on top of the proxy we are about to enable and leave the user
+        // "connected" with no working route.
+        for _ in 0..100 {
+            if !NET_REPAIRING.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         // Never let the startup cleanup thread clear the proxy we are about to
         // enable. It normally finishes in <100 ms, so this is effectively free.
         for _ in 0..100 {
@@ -2710,27 +2794,18 @@ fn is_connected() -> bool {
     if !CONNECTED.load(Ordering::SeqCst) {
         return false;
     }
-    // Detect a crashed core immediately instead of waiting for the watchdog,
-    // so the UI's heartbeat can show "connection lost" and reconnect.
-    let core_alive = match CHILD.lock() {
-        Ok(mut g) => match g.as_mut() {
-            Some(c) => matches!(c.try_wait(), Ok(None)),
-            None => false,
-        },
-        Err(_) => false,
-    };
-    if !core_alive {
+    // Detect a crashed core immediately. Restore the machine's own network
+    // settings at once — leaving the Windows proxy enabled with nothing
+    // listening is what used to make the whole PC offline until a reboot.
+    if !core_is_alive() {
         CONNECTED.store(false, Ordering::SeqCst);
-        app_log("core exited unexpectedly - connect again to restore the tunnel");
+        app_log("core exited unexpectedly - restoring network settings");
+        spawn_network_repair("core exit");
         return false;
     }
-    let tun_on = LAST
-        .lock()
-        .ok()
-        .and_then(|g| g.as_ref().map(|l| l.tun))
-        .unwrap_or(false);
-    if tun_on && !tun_alive() {
+    if tunnel_mode_is_tun() && !tun_alive() {
         CONNECTED.store(false, Ordering::SeqCst);
+        spawn_network_repair("TUN exit");
         return false;
     }
     true
@@ -2755,6 +2830,32 @@ fn reset_tunnel_state() {
     restore_proxy();
     set_keep_awake(false);
     CONNECTED.store(false, Ordering::SeqCst);
+}
+
+// A dead core with Windows still pointed at 127.0.0.1:10809 is the classic
+// "VPN dropped, now the whole PC has no internet until reboot" state. Restore
+// the machine's own proxy/TUN/DNS settings immediately. This is NOT a
+// reconnect: the user stays in control and can connect again when ready.
+fn repair_network_after_drop(reason: &'static str) {
+    if NET_REPAIRING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    app_log(&format!("network repair ({reason}): restoring proxy, TUN and routes"));
+    reset_tunnel_state();
+    #[cfg(windows)]
+    {
+        // TUN mode can leave a stale resolver cached after the adapter dies.
+        let mut cmd = std::process::Command::new("ipconfig");
+        cmd.args(["/flushdns"]);
+        hide_window(&mut cmd);
+        let _ = cmd.output();
+    }
+    refresh_system_proxy();
+    NET_REPAIRING.store(false, Ordering::SeqCst);
+}
+
+fn spawn_network_repair(reason: &'static str) {
+    std::thread::spawn(move || repair_network_after_drop(reason));
 }
 
 // force-disconnect: kill the xray child if any and restore the original
