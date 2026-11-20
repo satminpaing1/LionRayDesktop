@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.16";
+pub const APP_VERSION: &str = "1.8.17";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -3024,10 +3024,10 @@ async fn update_xray_core(url: String) -> Result<String, String> {
         Some(0)
     };
 
-    // rollback if broken or much slower (2.5x)
+    // rollback if broken or slower (1.5x) - stricter to avoid shipping slow cores
     let rollback = match (old_median, new_median) {
         (Some(o), Some(n)) if n == -2 => true, // broken
-        (Some(o), Some(n)) if n >= 0 && o > 0 && n > o * 5 / 2 => true,
+        (Some(o), Some(n)) if n >= 0 && o > 0 && n > o * 3 / 2 => true,
         (None, Some(n)) if n == -2 => true,
         _ => false,
     };
@@ -3122,7 +3122,7 @@ fn measure_core_latency_sync(exe: &std::path::Path, config_path: &std::path::Pat
     }
 
     let mut samples: Vec<i64> = Vec::new();
-    for _ in 0..2 {
+    for _ in 0..3 {
         let mut c = std::process::Command::new(curl_path);
         c.args([
             "-s",
