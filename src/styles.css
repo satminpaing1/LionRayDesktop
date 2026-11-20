@@ -507,26 +507,81 @@ input:checked + .slider::before { transform: translateX(20px); }
 }
 .row-act:hover { background: var(--primary-soft); color: var(--primary); }
 
-/* ── in-app log viewer ── */
-.log-tabs {
-  display: flex; gap: 6px; margin: 6px 0 10px;
+/* ── in-app log viewer: full-height workspace ── */
+.logs-content {
+  display: flex; flex-direction: column; overflow: hidden;
+  padding: 8px 12px 10px;
 }
+.log-toolbar { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.log-tabs { flex: 1; display: flex; gap: 5px; min-width: 0; }
 .log-tab {
-  flex: 1; padding: 9px 0; border: 1px solid var(--line); border-radius: 10px;
-  background: var(--card); color: var(--sub); font-size: 12px; font-weight: 700;
-  cursor: pointer;
+  flex: 1; min-width: 0; padding: 9px 2px; border: 1px solid var(--line); border-radius: 10px;
+  background: var(--card); color: var(--sub); font-size: 11.5px; font-weight: 700;
+  cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .log-tab.on { background: var(--primary-soft); color: var(--primary); border-color: var(--primary); }
-.log-actions { display: flex; gap: 8px; margin-bottom: 10px; }
-.log-actions .btn-secondary { flex: 1; font-size: 12px; padding: 9px 0; }
-.log-actions button:disabled { opacity: .5; cursor: default; }
+.log-actions { display: flex; gap: 5px; flex-shrink: 0; }
+.log-ico-btn {
+  width: 33px; height: 33px; border: 1px solid var(--line); border-radius: 9px;
+  background: var(--card); color: var(--sub); font-size: 14px; cursor: pointer;
+  display: grid; place-items: center;
+}
+.log-ico-btn:hover { background: var(--primary-soft); color: var(--primary); border-color: var(--primary); }
+.log-ico-btn.danger:hover { background: rgba(239,68,68,.1); color: var(--red); border-color: var(--red); }
+.log-ico-btn:disabled { opacity: .45; cursor: default; }
+
+.log-meta {
+  display: flex; align-items: center; gap: 7px; flex-shrink: 0;
+  font-size: 10.5px; color: var(--sub); padding: 9px 3px 7px;
+}
+.live-dot {
+  width: 7px; height: 7px; border-radius: 50%; background: var(--green);
+  box-shadow: 0 0 0 3px rgba(34,197,94,.16);
+}
+.log-meta-dot { opacity: .5; }
+.log-autoscroll {
+  margin-left: auto; border: 1px solid var(--line); background: var(--card);
+  color: var(--sub); border-radius: 20px; padding: 3px 9px;
+  font-size: 10px; font-weight: 700; cursor: pointer;
+}
+.log-autoscroll.on { background: var(--primary-soft); color: var(--primary); border-color: transparent; }
+
 .log-box {
-  background: #0d1424; border: 1px solid var(--line); border-radius: 12px;
-  padding: 10px; min-height: 260px; max-height: 60vh; overflow: auto;
+  flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain;
+  background: linear-gradient(180deg, #121b2e, #0b1120);
+  border: 1px solid var(--line); border-radius: 14px; padding: 8px 4px 10px;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.04), 0 8px 24px rgba(0,0,0,.14);
 }
-.dark .log-box { background: #060a14; }
 .log-pre {
-  font-family: Consolas, "Courier New", monospace; font-size: 10.5px;
-  line-height: 1.55; white-space: pre-wrap; word-break: break-all;
-  color: #cbd5e1; user-select: text;
+  margin: 0; font-family: Consolas, "Courier New", monospace; font-size: 11px;
+  line-height: 1.6; white-space: pre-wrap; word-break: break-all;
+  color: #cbd5e1; user-select: text; counter-reset: logline;
 }
+.log-line {
+  padding: 1px 8px 1px 4px; min-height: 18px; border-radius: 4px;
+  display: flex; gap: 9px;
+}
+.log-line::before {
+  counter-increment: logline; content: counter(logline);
+  flex-shrink: 0; width: 30px; text-align: right;
+  color: #475569; user-select: none; font-size: 10px;
+}
+.log-line.err { color: #fca5a5; background: rgba(239,68,68,.09); }
+.log-line.warn { color: #fcd34d; background: rgba(245,158,11,.07); }
+.log-line.ok { color: #86efac; }
+
+.log-empty {
+  height: 100%; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 6px; color: #64748b;
+}
+.log-empty span { font-size: 34px; opacity: .7; }
+.log-empty p { font-size: 13px; font-weight: 700; color: #94a3b8; }
+.log-empty small { font-size: 10.5px; }
+.log-footer {
+  flex-shrink: 0; font-size: 9.5px; color: var(--sub); opacity: .75;
+  text-align: center; padding-top: 7px; user-select: text;
+}
+.log-box::-webkit-scrollbar { width: 7px; height: 7px; }
+.log-box::-webkit-scrollbar-track { background: transparent; }
+.log-box::-webkit-scrollbar-thumb { background: #334155; border-radius: 8px; }
+.log-box::-webkit-scrollbar-thumb:hover { background: #475569; }

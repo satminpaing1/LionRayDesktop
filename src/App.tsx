@@ -269,6 +269,15 @@ function LiveStats() {
   );
 }
 
+// Colorise log lines so errors / warnings stand out at a glance.
+function logLineClass(line: string): string {
+  const s = line.toLowerCase();
+  if (/fatal|error|failed|refused|eof|timeout|timed out|probe failed|no usage|denied/.test(s)) return "err";
+  if (/warn|deprecated|retry|slow|stale/.test(s)) return "warn";
+  if (/ok|connected|confirmed|success|accepted|started|listening|204/.test(s)) return "ok";
+  return "";
+}
+
 function App() {
   const [tab, setTab] = useState<Tab>("home");
   const [servers, setServers] = useState<Server[]>([]);
@@ -296,6 +305,8 @@ function App() {
   const [logKind, setLogKind] = useState<LogKind>("app");
   const [logs, setLogs] = useState<Record<LogKind, string>>({ app: "", xray: "", singbox: "" });
   const [logBusy, setLogBusy] = useState(false);
+  const [autoScroll, setAutoScroll] = useState(true);
+  const logBoxRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -406,6 +417,17 @@ function App() {
     });
   }, [showToast]);
 
+  const copyLogs = useCallback(async () => {
+    const text = logs[logKind];
+    if (!text) { showToast("Copy လုပ်စရာ log မရှိသေးပါ", true); return; }
+    try {
+      await invoke("copy_clipboard", { text });
+      showToast("Log ကို copy လုပ်ပြီး ✅");
+    } catch (e) {
+      showToast(`Copy မရပါ: ${e}`, true);
+    }
+  }, [logs, logKind, showToast]);
+
   // Live-refresh while the Logs tab is open so a drop can be watched in real time.
   useEffect(() => {
     if (tab !== "logs") return;
@@ -413,6 +435,20 @@ function App() {
     const timer = setInterval(() => void loadLogs(true), 4000);
     return () => clearInterval(timer);
   }, [tab, loadLogs]);
+
+  // Follow the newest line unless the user scrolled up to read history.
+  useEffect(() => {
+    if (tab !== "logs" || !autoScroll) return;
+    const box = logBoxRef.current;
+    if (box) box.scrollTop = box.scrollHeight;
+  }, [logs, logKind, autoScroll, tab]);
+
+  const onLogScroll = useCallback(() => {
+    const box = logBoxRef.current;
+    if (!box) return;
+    const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 48;
+    setAutoScroll(atBottom);
+  }, []);
 
   // ─── restart with UAC so TUN mode can create its adapter ───
   const requestAdmin = useCallback(() => {
@@ -1546,34 +1582,57 @@ function App() {
             <span className="topbar-title">Logs</span>
             <span style={{ width: 46 }} />
           </header>
-          <div className="content">
-            <div className="log-tabs">
-              {([
-                ["app", "📱 App"],
-                ["xray", "🚀 Xray"],
-                ["singbox", "🛰️ TUN"],
-              ] as const).map(([id, label]) => (
-                <button
-                  key={id}
-                  className={`log-tab ${logKind === id ? "on" : ""}`}
-                  onClick={() => setLogKind(id)}
-                >
-                  {label}
-                </button>
-              ))}
+          <div className="content logs-content">
+            <div className="log-toolbar">
+              <div className="log-tabs">
+                {([
+                  ["app", "📱 App"],
+                  ["xray", "🚀 Xray"],
+                  ["singbox", "🛰️ TUN"],
+                ] as const).map(([id, label]) => (
+                  <button
+                    key={id}
+                    className={`log-tab ${logKind === id ? "on" : ""}`}
+                    onClick={() => setLogKind(id)}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <div className="log-actions">
+                <button className="log-ico-btn" onClick={() => void loadLogs()} disabled={logBusy} title="Refresh">↻</button>
+                <button className="log-ico-btn" onClick={() => void copyLogs()} title="Copy log">⧉</button>
+                <button className="log-ico-btn danger" onClick={clearLogs} title="Clear all logs">🗑</button>
+              </div>
             </div>
-            <div className="log-actions">
-              <button className="btn-secondary" onClick={() => void loadLogs()} disabled={logBusy}>
-                {logBusy ? "…" : "↻ Refresh"}
+            <div className="log-meta">
+              <span className="live-dot" />
+              <span>LIVE · 4s</span>
+              <span className="log-meta-dot">•</span>
+              <span>{logs[logKind] ? logs[logKind].split("\n").length.toLocaleString() : 0} lines</span>
+              <button
+                className={`log-autoscroll ${autoScroll ? "on" : ""}`}
+                onClick={() => setAutoScroll(!autoScroll)}
+              >
+                {autoScroll ? "▼ Auto-scroll" : "▽ Paused"}
               </button>
-              <button className="btn-secondary" onClick={clearLogs}>🗑 Clear All</button>
             </div>
-            <div className="log-box">
-              <pre className="log-pre">{logs[logKind] || "(Log မရှိသေးပါ / empty)"}</pre>
+            <div className="log-box" ref={logBoxRef} onScroll={onLogScroll}>
+              {logs[logKind] ? (
+                <pre className="log-pre">
+                  {logs[logKind].split("\n").map((line, i) => (
+                    <div key={i} className={`log-line ${logLineClass(line)}`}>{line || "\u00a0"}</div>
+                  ))}
+                </pre>
+              ) : (
+                <div className="log-empty">
+                  <span>📋</span>
+                  <p>Log မရှိသေးပါ</p>
+                  <small>ချိတ်ဆက်ပြီးရင် ဒီမှာ အလိုအလျောက် ပေါ်လာပါမယ်</small>
+                </div>
+              )}
             </div>
-            <div className="hint">
-              Log ဖိုင်တွေ %APPDATA%\lionray-vpn ထဲမှာ ရှိပါတယ်။ Clear လုပ်ရင် ချိတ်ထားတဲ့ session ရဲ့ log တွေလည်း ပါသွားပါမယ်။
-            </div>
+            <div className="log-footer">%APPDATA%\lionray-vpn · Clear လုပ်ရင် လက်ရှိ session log တွေလည်း ပါသွားပါမယ်</div>
           </div>
         </>
       )}
