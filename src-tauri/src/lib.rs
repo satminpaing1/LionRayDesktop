@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.5";
+pub const APP_VERSION: &str = "1.8.6";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -188,6 +188,137 @@ fn socks_listening() -> bool {
                 .is_ok()
         })
         .unwrap_or(false)
+}
+
+// ── diagnostics ─────────────────────────────────────────────
+// Tiny append-only log in %APPDATA%\lionray-vpn\app.log so a drop can be
+// traced afterwards. The core's own warnings go to xray.log / singbox.log.
+fn utc_stamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (h, m, s) = (rem / 3_600, (rem % 3_600) / 60, rem % 60);
+    // Howard Hinnant's civil_from_days
+    let z = days + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let yr = if mo <= 2 { y + 1 } else { y };
+    format!("{yr:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02}Z")
+}
+
+fn app_log(msg: &str) {
+    let Some(dir) = dirs::config_dir().map(|d| d.join("lionray-vpn")) else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("app.log");
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > 512 * 1024 {
+            let _ = std::fs::rename(&path, dir.join("app.old.log"));
+        }
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{} {}", utc_stamp(), msg);
+    }
+}
+
+// End-to-end probe through the local SOCKS inbound. Detects a tunnel that is
+// "up" locally (xray alive, port listening) but cannot reach the internet —
+// the exact case the old watchdog could never see.
+fn probe_via_socks() -> bool {
+    let Ok(proxy) = reqwest::Proxy::all(format!("socks5h://127.0.0.1:{SOCKS_PORT}")) else {
+        return false;
+    };
+    let Ok(client) = reqwest::blocking::Client::builder()
+        .proxy(proxy)
+        .connect_timeout(std::time::Duration::from_secs(4))
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+    else {
+        return false;
+    };
+    // Plain HTTP 204 endpoints: no TLS handshake, minimal overhead.
+    for url in [
+        "http://www.gstatic.com/generate_204",
+        "http://cp.cloudflare.com/generate_204",
+    ] {
+        if let Ok(r) = client.get(url).send() {
+            if r.status().is_success() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// In TUN mode all direct traffic is captured by the adapter, so a direct
+// request tests the whole sing-box -> xray path (routes, DNS, adapter).
+fn probe_direct() -> bool {
+    let Ok(client) = reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(4))
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+    else {
+        return false;
+    };
+    for url in [
+        "http://www.gstatic.com/generate_204",
+        "http://cp.cloudflare.com/generate_204",
+    ] {
+        if let Ok(r) = client.get(url).send() {
+            if r.status().is_success() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "windows")]
+fn system_proxy_is_ours() -> bool {
+    const KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+    let mut q = std::process::Command::new("reg");
+    q.args(["query", KEY, "/v", "ProxyEnable"]);
+    hide_window(&mut q);
+    let enabled = q
+        .output()
+        .ok()
+        .map(|o| {
+            let s = String::from_utf8_lossy(&o.stdout).to_ascii_lowercase();
+            s.split_whitespace().last().map(|t| t == "0x1").unwrap_or(false)
+        })
+        .unwrap_or(false);
+    if !enabled {
+        return false;
+    }
+    let mut q = std::process::Command::new("reg");
+    q.args(["query", KEY, "/v", "ProxyServer"]);
+    hide_window(&mut q);
+    q.output()
+        .ok()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout).contains(&format!("127.0.0.1:{HTTP_PORT}"))
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn system_proxy_is_ours() -> bool {
+    true
 }
 
 // Runs a blocking HTTP request OFF the async runtime (spawn_blocking) so a
@@ -1376,7 +1507,22 @@ fn start_tun(dns: &str, udp: bool, ipv6: bool) -> Result<(), String> {
 
         let mut cmd = std::process::Command::new(&path);
         cmd.args(["run", "-c"]).arg(&config_path).current_dir(&config_dir);
-        cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        // same reasoning as xray.log: file, not a pipe, not /dev/null
+        match std::fs::File::create(config_dir.join("singbox.log")) {
+            Ok(f) => {
+                if let Ok(err) = f.try_clone() {
+                    cmd.stdout(std::process::Stdio::from(f));
+                    cmd.stderr(std::process::Stdio::from(err));
+                } else {
+                    cmd.stdout(std::process::Stdio::from(f));
+                    cmd.stderr(std::process::Stdio::null());
+                }
+            }
+            Err(_) => {
+                cmd.stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+            }
+        }
         hide_window(&mut cmd);
 
         let child = cmd.spawn().map_err(|e| format!("Failed to start TUN engine: {e}"))?;
@@ -1600,30 +1746,53 @@ fn cached_dns(host: &str) -> Option<String> {
     }
 }
 
-/// System resolver with a hard time budget, so a stalled lookup cannot freeze
-/// the connect flow. Prefers IPv4 (these tunnels are almost always IPv4).
-fn system_lookup(host: &str, port: u16, budget: std::time::Duration) -> Option<String> {
+/// System resolver with a hard time budget, returning every IPv4 address.
+/// One Cloudflare edge IP can be unreachable from a given ISP while another
+/// works, so callers need the full list instead of just the first entry.
+fn system_lookup_all(host: &str, port: u16, budget: std::time::Duration) -> Vec<String> {
     use std::net::ToSocketAddrs;
     let host = host.to_string();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let found = (host.as_str(), port).to_socket_addrs().ok().and_then(|addrs| {
-            let mut v6 = None;
+        let mut v4: Vec<String> = Vec::new();
+        if let Ok(addrs) = (host.as_str(), port).to_socket_addrs() {
             for addr in addrs {
-                match addr.ip() {
-                    std::net::IpAddr::V4(ip) => return Some(ip.to_string()),
-                    std::net::IpAddr::V6(ip) => {
-                        if v6.is_none() {
-                            v6 = Some(ip.to_string());
-                        }
+                if let std::net::IpAddr::V4(ip) = addr.ip() {
+                    let s = ip.to_string();
+                    if !v4.contains(&s) {
+                        v4.push(s);
                     }
                 }
             }
-            v6
-        });
-        let _ = tx.send(found);
+        }
+        let _ = tx.send(v4);
     });
-    rx.recv_timeout(budget).ok().flatten()
+    rx.recv_timeout(budget).unwrap_or_default()
+}
+
+/// Race a short TCP handshake to each address and return the first success.
+fn first_reachable(addrs: &[String], port: u16, budget: std::time::Duration) -> Option<String> {
+    use std::net::{SocketAddr, TcpStream};
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut spawned = 0;
+    for ip in addrs {
+        let Ok(sock) = format!("{ip}:{port}").parse::<SocketAddr>() else {
+            continue;
+        };
+        let tx = tx.clone();
+        let ip = ip.clone();
+        std::thread::spawn(move || {
+            if TcpStream::connect_timeout(&sock, std::time::Duration::from_millis(900)).is_ok() {
+                let _ = tx.send(ip);
+            }
+        });
+        spawned += 1;
+    }
+    if spawned == 0 {
+        return None;
+    }
+    drop(tx);
+    rx.recv_timeout(budget).ok()
 }
 
 /// DNS-over-HTTPS fallback for networks whose plain DNS misbehaves. Runs on a
@@ -1677,7 +1846,16 @@ fn resolve_server_address(server: &Server) -> Option<String> {
     if is_ip_literal(&server.address) {
         return None;
     }
-    if let Some(ip) = system_lookup(&server.address, server.port, std::time::Duration::from_millis(1500)) {
+    let addrs = system_lookup_all(
+        &server.address,
+        server.port,
+        std::time::Duration::from_millis(1500),
+    );
+    if !addrs.is_empty() {
+        // Prefer an IP that actually accepts TCP. If none do right now, keep
+        // the first one so xray can still attempt it.
+        let ip = first_reachable(&addrs, server.port, std::time::Duration::from_millis(1200))
+            .unwrap_or_else(|| addrs[0].clone());
         cache_dns(&server.address, &ip);
         return Some(ip);
     }
@@ -1745,8 +1923,24 @@ fn establish(
 
     let mut cmd = std::process::Command::new(&xray_path);
     cmd.args(["run", "-c"]).arg(&config_path).current_dir(&config_dir);
-    // discard core logs so a full pipe buffer can never stall the tunnel
-    cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    // Write the core's warnings to a file instead of a pipe (a full pipe can
+    // stall the tunnel) and instead of /dev/null (which threw away the reason
+    // for drops). The file is truncated on every connect.
+    match std::fs::File::create(config_dir.join("xray.log")) {
+        Ok(f) => {
+            if let Ok(err) = f.try_clone() {
+                cmd.stdout(std::process::Stdio::from(f));
+                cmd.stderr(std::process::Stdio::from(err));
+            } else {
+                cmd.stdout(std::process::Stdio::from(f));
+                cmd.stderr(std::process::Stdio::null());
+            }
+        }
+        Err(_) => {
+            cmd.stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+        }
+    }
     hide_window(&mut cmd);
 
     let child = cmd.spawn().map_err(|e| format!("Failed to start xray: {e}"))?;
@@ -1861,11 +2055,16 @@ async fn connect(
     .map_err(|e| format!("connect task failed: {e}"))?;
 
     if let Err(e) = started {
+        app_log(&format!("connect failed: {e}"));
         cleanup();
         return Err(e);
     }
 
     AUTO.store(true, Ordering::SeqCst);
+    app_log(&format!(
+        "connect ok: {}:{} tun={} udp={} ipv6={} fragment={}",
+        server.address, server.port, tun_on, udp_on, ipv6_on, fragment_on
+    ));
     *LAST.lock().map_err(|e| e.to_string())? = Some(LastConnect {
         server,
         routing: r,
@@ -1885,6 +2084,7 @@ async fn disconnect() -> Result<String, String> {
     // Always run the full cleanup: even when CONNECTED is already false (the
     // core died, or the frontend missed a heartbeat) the user's intent is to
     // stop, so clear AUTO and any half-open TUN/proxy state too.
+    app_log("disconnect: requested by user");
     tokio::task::spawn_blocking(cleanup)
         .await
         .map_err(|e| format!("disconnect task failed: {e}"))?;
@@ -1907,6 +2107,7 @@ fn is_connected() -> bool {
     };
     if !core_alive {
         CONNECTED.store(false, Ordering::SeqCst);
+        app_log("core exited unexpectedly - watchdog will reconnect");
         return false;
     }
     let tun_on = LAST
@@ -1922,11 +2123,11 @@ fn is_connected() -> bool {
 }
 
 // ── lifecycle cleanup ──
-// force-disconnect: kill the xray child if any and restore the original
-// network (clear the system proxy) so closing the app never leaves the box
-// hijacked / half-connected. Also clears the auto-reconnect intent and the
-// keep-awake request so a manual disconnect stays a manual disconnect.
-fn cleanup() {
+// Tear down the tunnel but keep the user's "stay connected" intent. Used by the
+// watchdog between retry attempts; `cleanup` adds the AUTO reset for a real
+// manual disconnect. (The old watchdog called cleanup() on repeated failures,
+// which silently turned AUTO off and stopped reconnecting forever.)
+fn reset_tunnel_state() {
     // stop the TUN adapter first: it owns the default routes, so removing it
     // before xray avoids a short window where traffic is sent to a dead proxy
     stop_tun();
@@ -1940,6 +2141,14 @@ fn cleanup() {
     set_system_proxy(false);
     set_keep_awake(false);
     CONNECTED.store(false, Ordering::SeqCst);
+}
+
+// force-disconnect: kill the xray child if any and restore the original
+// network (clear the system proxy) so closing the app never leaves the box
+// hijacked / half-connected. Also clears the auto-reconnect intent and the
+// keep-awake request so a manual disconnect stays a manual disconnect.
+fn cleanup() {
+    reset_tunnel_state();
     AUTO.store(false, Ordering::SeqCst);
 }
 
@@ -2666,6 +2875,7 @@ pub fn run() {
             // these spawn reg/netsh child processes and must not hold up the
             // first webview paint. `connect` waits for the flag below.
             std::thread::spawn(|| {
+                app_log(&format!("app start v{}", APP_VERSION));
                 restore_stale_proxy();
                 clear_tunnel_host_route();
                 restore_singbox_tun_state();
@@ -2691,24 +2901,26 @@ pub fn run() {
             #[cfg(windows)]
             std::thread::spawn(sweep_phantom_wintun);
 
-            // Auto-reconnect watchdog: while the user intends to be connected
-            // (AUTO), if the tunnel dies — xray crashed, a flaky subscription
-            // node dropped, or the PC woke from sleep with a dead core — replay
-            // the last successful connection. Gives up after a few retries so a
-            // permanently dead node doesn't spawn xray in a loop forever.
+            // Self-healing watchdog. Detects three distinct failures:
+            //  * hard — xray / sing-box process exited
+            //  * soft — the local SOCKS port stopped accepting connections
+            //  * net  — process alive and port listening, but the tunnel cannot
+            //           carry traffic (this is what used to require a manual
+            //           reconnect after a drop)
+            // It never "gives up" while AUTO is set; it only backs off.
             std::thread::spawn(|| {
                 let mut retries: u32 = 0;
-                // A single failed probe must not trigger a full reconnect: xray
-                // can be briefly busy (slow DNS, a large download) and
-                // socks_listening() would report "dead" for one cycle. Require
-                // several consecutive dead probes before tearing the tunnel down.
                 let mut dead_streak: u32 = 0;
-                const DEAD_THRESHOLD: u32 = 2; // 2 * 10s = 20s of confirmed death
+                let mut probe_fail_streak: u32 = 0;
+                let mut tick: u32 = 0;
+                const DEAD_THRESHOLD: u32 = 2; // 2 * 5 s for soft failures
                 loop {
-                    std::thread::sleep(std::time::Duration::from_secs(10));
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    tick = tick.wrapping_add(1);
                     if !AUTO.load(Ordering::SeqCst) {
                         retries = 0;
                         dead_streak = 0;
+                        probe_fail_streak = 0;
                         continue;
                     }
                     let child_alive = match CHILD.lock() {
@@ -2723,39 +2935,77 @@ pub fn run() {
                         .ok()
                         .and_then(|g| g.as_ref().map(|l| l.tun))
                         .unwrap_or(false);
-                    let dead = !child_alive || !socks_listening() || (tun_needed && !tun_alive());
-                    if !dead {
+                    let hard_dead = !child_alive || (tun_needed && !tun_alive());
+                    let soft_dead = !hard_dead && !socks_listening();
+
+                    // End-to-end probe every 30 s. In TUN mode a direct request
+                    // traverses the adapter, so it tests the whole path.
+                    let mut net_dead = false;
+                    if !hard_dead && !soft_dead && tick % 6 == 0 {
+                        let ok = if tun_needed { probe_direct() } else { probe_via_socks() };
+                        if ok {
+                            probe_fail_streak = 0;
+                        } else {
+                            probe_fail_streak += 1;
+                            app_log(&format!(
+                                "watchdog: tunnel probe failed ({probe_fail_streak}/3)"
+                            ));
+                            net_dead = probe_fail_streak >= 3;
+                        }
+                    }
+
+                    // Another app/installer can flip the Windows proxy off;
+                    // restore ours every 60 s so the browser keeps using it.
+                    if !hard_dead && !soft_dead && !net_dead && !tun_needed && tick % 12 == 0 {
+                        if !system_proxy_is_ours() {
+                            app_log("watchdog: system proxy was reset - restoring");
+                            set_system_proxy(true);
+                        }
+                    }
+
+                    if !hard_dead && !soft_dead && !net_dead {
                         retries = 0;
                         dead_streak = 0;
                         continue;
                     }
-                    dead_streak += 1;
-                    if dead_streak < DEAD_THRESHOLD {
-                        // transient hiccup — wait another cycle before acting
-                        continue;
+                    if !hard_dead && !net_dead {
+                        dead_streak += 1;
+                        if dead_streak < DEAD_THRESHOLD {
+                            continue;
+                        }
                     }
                     dead_streak = 0;
-                    if retries >= 6 {
-                        // Stop retrying, but also restore the system proxy and
-                        // TUN routes: leaving them pointing at a dead core makes
-                        // every app on the machine act offline until a restart.
-                        cleanup();
-                        retries = 0;
+                    probe_fail_streak = 0;
+
+                    let Some(l) = LAST.lock().ok().and_then(|g| g.clone()) else {
+                        app_log("watchdog: no saved connection - auto-reconnect stopped");
+                        reset_tunnel_state();
+                        AUTO.store(false, Ordering::SeqCst);
                         continue;
-                    }
-                    retries += 1;
-                    if let Some(l) = LAST.lock().ok().and_then(|g| g.clone()) {
-                        let _ = establish(
-                            &l.server, &l.routing, &l.dns, l.ad_block, &l.bypass, l.tun, l.udp,
-                            l.ipv6, l.fragment,
-                        );
-                        // cooldown: give the new tunnel time to settle before the
-                        // next probe, so a slow handshake isn't mistaken for a
-                        // fresh failure.
+                    };
+                    retries = retries.saturating_add(1);
+                    app_log(&format!(
+                        "watchdog: reconnect attempt {retries} (hard={hard_dead} net={net_dead})"
+                    ));
+                    let ok = establish(
+                        &l.server, &l.routing, &l.dns, l.ad_block, &l.bypass, l.tun, l.udp,
+                        l.ipv6, l.fragment,
+                    )
+                    .is_ok();
+                    if ok {
+                        retries = 0;
+                        app_log("watchdog: reconnected");
+                        // let the new tunnel settle before the next probe
                         std::thread::sleep(std::time::Duration::from_secs(15));
                     } else {
-                        cleanup();
-                        retries = 0;
+                        // Don't leave the OS pointing at a dead core while we
+                        // back off — every app would look offline.
+                        reset_tunnel_state();
+                        let backoff = if retries >= 6 { 60 } else { 15 };
+                        app_log(&format!(
+                            "watchdog: reconnect failed - next attempt in {backoff}s"
+                        ));
+                        std::thread::sleep(std::time::Duration::from_secs(backoff));
                     }
                 }
             });
