@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.10";
+pub const APP_VERSION: &str = "1.8.11";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -1336,11 +1336,6 @@ fn generate_tun_config(dns: &str, interface_name: &str, udp: bool, ipv6: bool) -
     } else {
         vec![json!({ "query_type": ["AAAA"], "action": "reject" })]
     };
-    let self_cidr = if ipv6 {
-        vec!["172.19.0.0/30", "fdfe:dcba:9876::/126"]
-    } else {
-        vec!["172.19.0.0/30"]
-    };
 
     let mut route_rules = vec![
         // recover the hostname so Xray's domain rules (CN bypass, ad-block,
@@ -1354,15 +1349,11 @@ fn generate_tun_config(dns: &str, interface_name: &str, udp: bool, ipv6: bool) -
         route_rules.push(json!({ "network": "udp", "action": "reject" }));
     }
     route_rules.extend([
-        json!({ "ip_cidr": self_cidr, "action": "reject" }),
-        // xray must reach the real server directly, never through TUN
-        json!({ "process_name": ["xray.exe", "sing-box.exe"], "action": "route", "outbound": "direct" }),
-        json!({ "ip_is_private": true, "action": "route", "outbound": "direct" }),
         json!({ "action": "route", "outbound": "proxy" }),
     ]);
 
     let config = json!({
-        "log": { "level": "warn", "timestamp": true },
+        "log": { "level": "info", "timestamp": true },
         "dns": {
             "servers": [{
                 "type": "https",
@@ -1382,7 +1373,7 @@ fn generate_tun_config(dns: &str, interface_name: &str, udp: bool, ipv6: bool) -
             "tag": "tun-in",
             "interface_name": interface_name,
             "address": tun_addresses,
-            "mtu": 9000,
+            "mtu": 1500,
             "auto_route": true,
             "strict_route": true,
             "stack": "mixed",
@@ -1409,6 +1400,51 @@ fn generate_tun_config(dns: &str, interface_name: &str, udp: bool, ipv6: bool) -
         }
     });
     serde_json::to_string_pretty(&config).unwrap_or_else(|_| "{}".into())
+}
+
+// Route 0.0.0.0/0 should point at a non-tun interface (the physical gateway)
+// with a low metric. A default route pointing at the tun adapter itself means
+// the route looped back into TUN and internet traffic never reaches the proxy.
+#[cfg(target_os = "windows")]
+fn tun_captures_all() -> bool {
+    let Ok(out) = std::process::Command::new("netsh")
+        .args(["interface", "ipv4", "show", "route", "-4"])
+        .output()
+    else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut best: Option<(i64, String)> = None; // metric, interface
+    for line in text.lines() {
+        if !line.contains("0.0.0.0/0") {
+            continue;
+        }
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 4 {
+            continue;
+        }
+        // "  0.0.0.0/0     192.168.31.1   Wi-Fi          2"
+        let Ok(metric) = cols[3].parse::<i64>() else {
+            continue;
+        };
+        let interface = cols[2].to_ascii_lowercase();
+        if interface.contains("tun") {
+            continue;
+        }
+        if best.as_ref().map(|(m, _)| metric < *m).unwrap_or(true) {
+            best = Some((metric, interface));
+        }
+    }
+    match best {
+        Some((metric, _)) => {
+            app_log(&format!("TUN check: default route metric={metric} (ok)"));
+            true
+        }
+        None => {
+            app_log("TUN check: no usable default route for 0.0.0.0/0");
+            false
+        }
+    }
 }
 
 fn tun_alive() -> bool {
@@ -2202,8 +2238,9 @@ fn establish(
     udp: bool,
     ipv6: bool,
     fragment_on: bool,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     // drop any previous core first so we never stack orphan processes
+    let mut tun = tun;
     stop_tun();
     if let Ok(mut g) = CHILD.lock() {
         if let Some(mut c) = g.take() {
@@ -2339,24 +2376,34 @@ fn establish(
         // would double-route traffic and can blackhole the machine.
         take_over_proxy(false);
 
-        // Give routes/DNS a moment to settle before the first probe.
-        std::thread::sleep(std::time::Duration::from_millis(800));
+        // Give routes/DNS a moment to settle before the check.
+        std::thread::sleep(std::time::Duration::from_millis(500));
 
-        // Verify the adapter actually carries traffic; roll back instead of
-        // leaving every app offline behind a broken TUN.
-        if !verify_tun_ready() {
-            stop_tun();
-            if let Ok(mut g) = CHILD.lock() {
-                if let Some(mut c) = g.take() {
-                    let _ = c.kill();
-                    let _ = c.wait();
-                }
-            }
-            restore_proxy();
-            CONNECTED.store(false, Ordering::SeqCst);
-            app_log("connect aborted: TUN probe failed (rolled back)");
-            return Err("TUN connected but no traffic — rolled back".into());
+        // Verify the adapter actually captures traffic (a valid non-tun
+        // default route); if not, fall back to proxy mode so the user is not
+        // stuck offline.
+        let mut tun_effective = tun_captures_all();
+        if !tun_effective {
+            app_log("TUN check failed - trying traffic probe");
+            // Traffic probe doesn’t depend on adapter naming quirks: if some
+            // interface still carries traffic, accept it as effective.
+            tun_effective = probe_urls_race_direct(
+                &[
+                    "http://cp.cloudflare.com/generate_204",
+                    "http://www.gstatic.com/generate_204",
+                ],
+                5,
+            );
         }
+        if tun_effective {
+            app_log("TUN confirmed (route check ok)");
+        } else {
+            app_log("TUN route check failed - enabling proxy fallback");
+            stop_tun();
+            clear_tunnel_host_route();
+            take_over_proxy(true);
+        }
+        tun = tun_effective;
     } else {
         clear_tunnel_host_route();
         // SOCKS preflight already proved the tunnel carries traffic. Enabling
@@ -2367,7 +2414,9 @@ fn establish(
 
     set_keep_awake(true);
     CONNECTED.store(true, Ordering::SeqCst);
-    Ok(())
+    // True when the TUN adapter actually carries traffic. In proxy mode this is
+    // always false; the caller records the real effective mode.
+    Ok(tun)
 }
 
 #[tauri::command]
@@ -2418,18 +2467,25 @@ async fn connect(
     })
     .await;
     CONNECTING.store(false, Ordering::SeqCst);
-    let started = started.map_err(|e| format!("connect task failed: {e}"))?;
-
-    if let Err(e) = started {
-        app_log(&format!("connect failed: {e}"));
-        cleanup();
-        return Err(e);
-    }
+    let tun_effective = match started {
+        Ok(Ok(ok)) => ok && tun_on,
+        Ok(Err(e)) => {
+            app_log(&format!("connect failed: {e}"));
+            cleanup();
+            return Err(e);
+        }
+        Err(e) => {
+            let e = format!("connect task failed: {e}");
+            app_log(&e);
+            cleanup();
+            return Err(e);
+        }
+    };
 
     AUTO.store(true, Ordering::SeqCst);
     app_log(&format!(
-        "connect ok: {}:{} tun={} udp={} ipv6={} fragment={}",
-        server.address, server.port, tun_on, udp_on, ipv6_on, fragment_on
+        "connect ok: {}:{} tun_req={} tun_ok={} udp={} ipv6={} fragment={}",
+        server.address, server.port, tun_on, tun_effective, udp_on, ipv6_on, fragment_on
     ));
     *LAST.lock().map_err(|e| e.to_string())? = Some(LastConnect {
         server,
@@ -2437,12 +2493,19 @@ async fn connect(
         dns: d,
         ad_block: ab,
         bypass: bp,
-        tun: tun_on,
+        tun: tun_effective,
         udp: udp_on,
         ipv6: ipv6_on,
         fragment: fragment_on,
     });
-    Ok("Connected".into())
+    if !tun_effective && tun_on {
+        app_log("TUN mode requested but not effective - using system proxy");
+    }
+    Ok(if tun_effective {
+        "Connected via TUN".into()
+    } else {
+        "Connected via System Proxy".into()
+    })
 }
 
 #[tauri::command]

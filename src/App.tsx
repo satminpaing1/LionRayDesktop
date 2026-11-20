@@ -403,7 +403,7 @@ function App() {
       }
       setBusy(true);
       try {
-        await invoke("connect", {
+        const mode = await invoke<string>("connect", {
           server: { ...srv, id: 0, ping: null },
           routing: settings.routing,
           dns: settings.dns,
@@ -415,8 +415,9 @@ function App() {
           fragment: settings.fragment,
         });
         setConnected(true);
-        if (!silent) showToast("Connected ✓");
-        else showToast(`Auto-connected to ${srv.name}`);
+        const label = settings.tunMode && mode?.includes("Proxy") ? "Proxy ✓" : "Connected ✓";
+        if (!silent) showToast(label, false);
+        else showToast(`Auto-connected: ${mode?.replace("Connected via", "").trim() || "tunnel"}`);
       } catch (e) {
         if (!silent) showToast(String(e), true);
       }
