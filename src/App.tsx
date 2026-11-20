@@ -250,12 +250,12 @@ function LiveStats() {
     <>
       <div className="power-sub">Session {fmtTime(elapsed)}</div>
       <div className="speed-row">
-        <div className="speed-box">
+        <div className="speed-box down">
           <span className="speed-ico">⬇</span>
           <b className="speed-val">{speeds.down}</b>
           <small>DOWNLOAD</small>
         </div>
-        <div className="speed-box">
+        <div className="speed-box up">
           <span className="speed-ico up">⬆</span>
           <b className="speed-val">{speeds.up}</b>
           <small>UPLOAD</small>
@@ -1113,7 +1113,7 @@ function App() {
           </header>
 
           {/* node card */}
-          <div className="node-card" onClick={() => setTab("servers")}>
+          <div className={`node-card ${connected ? "live" : ""}`} onClick={() => setTab("servers")}>
             <div className="node-left">
               <div className="node-name">
                 {connected && exitInfo?.countryCode && (

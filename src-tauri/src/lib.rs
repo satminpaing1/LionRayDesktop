@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.26";
+pub const APP_VERSION: &str = "1.8.27";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -111,6 +111,39 @@ fn set_keep_awake(on: bool) {
 
 #[cfg(not(windows))]
 fn set_keep_awake(_on: bool) {}
+
+// Keep the tunnel warm independently of the WebView. When the window is
+// minimized the frontend timers are throttled by Chromium, and a CDN can treat
+// a few quiet minutes as a dead WebSocket. The next click then pays for a full
+// TCP+TLS+WS handshake and feels slow. This loop only sends a tiny request
+// through the ACTIVE data path — it never kills, restarts or reconnects
+// anything, so the calm "no watchdog" behaviour stays intact.
+fn start_tunnel_keepalive() {
+    std::thread::spawn(|| {
+        // Let startup cleanup / an auto-connect settle before the first tick.
+        std::thread::sleep(std::time::Duration::from_secs(12));
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(20));
+            if !CONNECTED.load(Ordering::SeqCst) || CONNECTING.load(Ordering::SeqCst) {
+                continue;
+            }
+            let tun_on = TUN_CHILD.lock().map(|g| g.is_some()).unwrap_or(false);
+            let mut builder = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(6));
+            if !tun_on {
+                // Proxy mode: Xray's SOCKS port is the real data path.
+                match reqwest::Proxy::all(format!("socks5h://127.0.0.1:{SOCKS_PORT}")) {
+                    Ok(p) => builder = builder.proxy(p),
+                    Err(_) => continue,
+                }
+            }
+            // TUN mode owns the default route, so a plain request enters it.
+            if let Ok(client) = builder.build() {
+                let _ = client.get("http://www.gstatic.com/generate_204").send();
+            }
+        }
+    });
+}
 
 // ───────────────────────── administrator detection ─────────────────────────
 // TUN mode creates a virtual adapter and rewrites the system routing table,
@@ -839,7 +872,13 @@ fn build_stream(server: &Server) -> Value {
 
     match server.network.as_str() {
         "ws" => {
-            let mut ws = json!({ "path": if server.ws_path.is_empty() { "/" } else { server.ws_path.as_str() } });
+            let mut ws = json!({
+                "path": if server.ws_path.is_empty() { "/" } else { server.ws_path.as_str() },
+                // CDNs silently drop idle WebSockets (often after ~60 s). A
+                // 20 s heartbeat keeps the upstream alive so the first request
+                // after the PC sat idle doesn't pay for a fresh handshake.
+                "heartbeatPeriod": 20
+            });
             if !server.ws_host.is_empty() {
                 ws["headers"] = json!({ "Host": server.ws_host });
             }
@@ -2781,12 +2820,20 @@ async fn ping_server(address: String, port: u16) -> Result<u64, String> {
 #[tauri::command]
 async fn check_exit_ip() -> Result<Value, String> {
     tokio::task::spawn_blocking(move || {
-        let proxy = reqwest::Proxy::all(format!("socks5h://127.0.0.1:{SOCKS_PORT}")).map_err(|e| e.to_string())?;
-        let proxied = reqwest::blocking::Client::builder()
-            .proxy(proxy)
-            .timeout(std::time::Duration::from_secs(8))
-            .build()
-            .map_err(|e| e.to_string())?;
+        // Keep the ACTIVE data path warm. In proxy mode that is Xray's SOCKS
+        // port; in TUN mode a plain request already enters sing-box, so using
+        // SOCKS here would leave the real tunnel idle and the first request
+        // after a pause would stall on a fresh upstream handshake.
+        let tunnel_is_tun = TUN_CHILD.lock().map(|g| g.is_some()).unwrap_or(false);
+        let mut builder = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(8));
+        if !tunnel_is_tun {
+            builder = builder.proxy(
+                reqwest::Proxy::all(format!("socks5h://127.0.0.1:{SOCKS_PORT}"))
+                    .map_err(|e| e.to_string())?,
+            );
+        }
+        let proxied = builder.build().map_err(|e| e.to_string())?;
         let direct = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(6))
             .build()
@@ -3516,12 +3563,13 @@ pub fn run() {
             #[cfg(windows)]
             std::thread::spawn(sweep_phantom_wintun);
 
-            // No background auto-reconnect watchdog. Older releases (1.8.x)
-            // probed the tunnel every few seconds and re-established it on any
-            // soft failure, which on a slow-but-healthy line caused the VPN to
-            // drop and reconnect by itself. This restores the calm v1.6.0
-            // behaviour: the connection stays up until the user disconnects or
-            // the core genuinely exits, and `is_connected()` reflects that.
+            // Tiny keep-warm requests only — NOT a reconnect watchdog. Older
+            // releases (1.8.x) probed and re-established on any soft failure,
+            // which on a slow-but-healthy line caused self-triggered drop /
+            // reconnect loops. This restores the calm v1.6.0 behaviour: the
+            // connection stays up until the user disconnects or the core
+            // genuinely exits, and `is_connected()` reflects that.
+            start_tunnel_keepalive();
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -3599,6 +3647,20 @@ mod tests {
             outbounds[0]["streamSettings"]["wsSettings"]["path"],
             "/?ed=2560"
         );
+    }
+
+    #[test]
+    fn ws_keeps_idle_tunnel_warm_with_heartbeat() {
+        let cfg: Value = serde_json::from_str(
+            &generate_config(&user_server(), "global", "system", false, &[], false, false, false)
+                .unwrap(),
+        )
+        .unwrap();
+        let ws = &cfg["outbounds"][0]["streamSettings"]["wsSettings"];
+        // CDNs drop quiet WebSockets; a 20s ping avoids a slow "first request
+        // after idle" without restarting anything.
+        assert_eq!(ws["heartbeatPeriod"], 20);
+        assert_eq!(ws["path"], "/?ed=2560");
     }
 
     #[test]
