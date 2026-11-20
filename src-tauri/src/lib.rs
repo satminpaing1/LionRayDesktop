@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.13";
+pub const APP_VERSION: &str = "1.8.14";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -2978,7 +2978,7 @@ async fn update_xray_core(url: String) -> Result<String, String> {
         let out = tokio::task::spawn_blocking({
             let new_exe = new_exe.clone();
             let cp = config_path.clone();
-            move || std::process::Command::new(&new_exe).args(["run", "-test", "-c"]).arg(&cp).output()
+            move || { let mut c = std::process::Command::new(&new_exe); c.args(["run", "-test", "-c"]).arg(&cp); hide_window(&mut c); c.output() }
         })
         .await
         .ok()
@@ -3071,7 +3071,7 @@ fn measure_core_latency_sync(exe: &std::path::Path, config_path: &std::path::Pat
         Err(_) => return Some(-1),
     };
     let mut ready = false;
-    for _ in 0..50 {
+    for _ in 0..30 {
         std::thread::sleep(std::time::Duration::from_millis(100));
         if child.try_wait().ok().flatten().is_some() {
             break;
@@ -3094,28 +3094,32 @@ fn measure_core_latency_sync(exe: &std::path::Path, config_path: &std::path::Pat
         "curl"
     };
     // quick spawn test
-    if std::process::Command::new(curl_path).arg("--version").output().is_err() {
+    let mut cv = std::process::Command::new(curl_path);
+    cv.arg("--version");
+    hide_window(&mut cv);
+    if cv.output().is_err() {
         let _ = child.kill();
         let _ = child.wait();
         return Some(-1);
     }
 
     let mut samples: Vec<i64> = Vec::new();
-    for _ in 0..3 {
-        let out = std::process::Command::new(curl_path)
-            .args([
-                "-s",
-                "--socks5-hostname",
-                "127.0.0.1:10808",
-                "--max-time",
-                "15",
-                "-o",
-                "NUL",
-                "-w",
-                "%{time_appconnect}",
-                "https://www.google.com/generate_204",
-            ])
-            .output();
+    for _ in 0..2 {
+        let mut c = std::process::Command::new(curl_path);
+        c.args([
+            "-s",
+            "--socks5-hostname",
+            "127.0.0.1:10808",
+            "--max-time",
+            "8",
+            "-o",
+            "NUL",
+            "-w",
+            "%{time_appconnect}",
+            "https://www.google.com/generate_204",
+        ]);
+        hide_window(&mut c);
+        let out = c.output();
         if let Ok(o) = out {
             let s = String::from_utf8_lossy(&o.stdout);
             if let Ok(ms) = s.trim().parse::<f64>() {
