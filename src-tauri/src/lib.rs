@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.29";
+pub const APP_VERSION: &str = "1.8.30";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -93,11 +93,18 @@ fn hide_window(cmd: &mut std::process::Command) {
 // so a screen-off idle never suspends xray and kills the tunnel. Display may
 // still turn off; we only suppress SYSTEM sleep.
 #[cfg(windows)]
+#[link(name = "kernel32")]
 extern "system" {
     fn SetThreadExecutionState(es_flags: u32) -> u32;
-    // Registry-only proxy changes are cached by WinINET/Chrome until a system
-    // notification arrives. That is why "reboot fixes the internet" after a
-    // drop. Broadcast the change so every app picks it up immediately.
+}
+
+// Registry-only proxy changes are cached by WinINET/Chrome until a system
+// notification arrives. That is why "reboot fixes the internet" after a drop.
+// Broadcast the change so every app picks it up immediately. Needs wininet.lib;
+// without the explicit link attribute release builds fail at LNK2019.
+#[cfg(windows)]
+#[link(name = "wininet")]
+extern "system" {
     fn InternetSetOption(
         h_internet: *mut std::ffi::c_void,
         dw_option: u32,
