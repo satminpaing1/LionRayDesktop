@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.18";
+pub const APP_VERSION: &str = "1.8.19";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -3058,7 +3058,11 @@ async fn update_xray_core(url: String) -> Result<String, String> {
         let bd = bundle_dir.clone();
         tokio::task::spawn_blocking(move || restore_bundle_backup(&bd)).await.ok();
         let _ = std::fs::remove_dir_all(&tmp);
-        return Err("New core is slower or broken - kept previous core.".to_string());
+        let msg = match new_median {
+            Some(-2) => "New core cannot reach the server - kept previous core.".to_string(),
+            _ => "New core is slower or broken - kept previous core.".to_string(),
+        };
+        return Err(msg);
     }
 
     let _ = std::fs::remove_dir_all(&tmp);
@@ -3097,15 +3101,32 @@ fn backup_bundle(_d: &std::path::Path) {}
 #[cfg(not(target_os = "windows"))]
 fn restore_bundle_backup(_d: &std::path::Path) {}
 
-// Returns: -2 = broken (socks never came up), -1 = curl unavailable (skip),
+// Returns: -2 = broken (socks never came up or server unreachable), -1 = curl unavailable (skip),
 // >=0 = median TLS handshake time in ms.
 fn measure_core_latency_sync(exe: &std::path::Path, config_path: &std::path::Path) -> Option<i64> {
+    let log_path = config_path
+        .parent()
+        .map(|d| d.join("xray-update-test.log"))
+        .unwrap_or_else(|| std::path::PathBuf::from("xray-update-test.log"));
+    let _ = std::fs::remove_file(&log_path);
     let mut cmd = std::process::Command::new(exe);
     cmd.args(["run", "-c"]).arg(config_path);
     if let Some(d) = config_path.parent() {
         cmd.current_dir(d);
     }
-    cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    // capture stderr to a file so we can detect server connection failures
+    let log_file = std::fs::File::create(&log_path).ok();
+    if let Some(f) = log_file {
+        let err_clone = f.try_clone().ok();
+        cmd.stdout(std::process::Stdio::null());
+        if let Some(ec) = err_clone {
+            cmd.stderr(std::process::Stdio::from(ec));
+        } else {
+            cmd.stderr(std::process::Stdio::null());
+        }
+    } else {
+        cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    }
     hide_window(&mut cmd);
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -3170,6 +3191,17 @@ fn measure_core_latency_sync(exe: &std::path::Path, config_path: &std::path::Pat
     }
     let _ = child.kill();
     let _ = child.wait();
+
+    // check the log for server connection failures (EOF, failed to dial, etc.)
+    if let Ok(log) = std::fs::read_to_string(&log_path) {
+        let lower = log.to_lowercase();
+        if lower.contains("failed to dial") || lower.contains("eof") || lower.contains("connection refused") {
+            let _ = std::fs::remove_file(&log_path);
+            return Some(-2); // broken: cannot reach server
+        }
+    }
+    let _ = std::fs::remove_file(&log_path);
+
     if samples.is_empty() {
         return Some(-1);
     }
