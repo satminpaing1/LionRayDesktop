@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.6";
+pub const APP_VERSION: &str = "1.8.7";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -236,84 +236,113 @@ fn app_log(msg: &str) {
     }
 }
 
-// End-to-end probe through the local SOCKS inbound. Detects a tunnel that is
-// "up" locally (xray alive, port listening) but cannot reach the internet —
-// the exact case the old watchdog could never see.
-fn probe_via_socks() -> bool {
+fn probe_url_via_socks(url: &str, secs: u64) -> bool {
     let Ok(proxy) = reqwest::Proxy::all(format!("socks5h://127.0.0.1:{SOCKS_PORT}")) else {
         return false;
     };
     let Ok(client) = reqwest::blocking::Client::builder()
         .proxy(proxy)
-        .connect_timeout(std::time::Duration::from_secs(4))
-        .timeout(std::time::Duration::from_secs(8))
+        .connect_timeout(std::time::Duration::from_secs(secs))
+        .timeout(std::time::Duration::from_secs(secs))
         .build()
     else {
         return false;
     };
-    // Plain HTTP 204 endpoints: no TLS handshake, minimal overhead.
-    for url in [
-        "http://www.gstatic.com/generate_204",
-        "http://cp.cloudflare.com/generate_204",
-    ] {
-        if let Ok(r) = client.get(url).send() {
-            if r.status().is_success() {
-                return true;
-            }
-        }
-    }
-    false
+    client
+        .get(url)
+        .send()
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+}
+
+fn probe_url_direct(url: &str, secs: u64) -> bool {
+    let Ok(client) = reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(secs))
+        .timeout(std::time::Duration::from_secs(secs))
+        .build()
+    else {
+        return false;
+    };
+    client
+        .get(url)
+        .send()
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+}
+
+// End-to-end probe through the local SOCKS inbound. Detects a tunnel that is
+// "up" locally (xray alive, port listening) but cannot reach the internet —
+// the exact case the old watchdog could never see.
+fn probe_via_socks() -> bool {
+    probe_url_via_socks("http://www.gstatic.com/generate_204", 8)
+        || probe_url_via_socks("http://cp.cloudflare.com/generate_204", 8)
 }
 
 // In TUN mode all direct traffic is captured by the adapter, so a direct
 // request tests the whole sing-box -> xray path (routes, DNS, adapter).
 fn probe_direct() -> bool {
+    probe_url_direct("http://www.gstatic.com/generate_204", 8)
+        || probe_url_direct("http://cp.cloudflare.com/generate_204", 8)
+}
+
+// Pre-flight before enabling a machine-wide proxy/TUN. Plain HTTP 204
+// endpoints are used (no extra TLS cost) but the request still crosses the
+// full VLESS/WS tunnel.
+fn verify_tunnel_ready() -> bool {
+    probe_url_via_socks("http://www.gstatic.com/generate_204", 6)
+        || probe_url_via_socks("http://cp.cloudflare.com/generate_204", 5)
+}
+
+fn verify_tun_ready() -> bool {
+    probe_url_direct("http://www.gstatic.com/generate_204", 6)
+        || probe_url_direct("http://cp.cloudflare.com/generate_204", 5)
+}
+
+fn probe_url_via_http_proxy(url: &str, secs: u64) -> bool {
+    let Ok(proxy) = reqwest::Proxy::all(format!("http://127.0.0.1:{HTTP_PORT}")) else {
+        return false;
+    };
     let Ok(client) = reqwest::blocking::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(4))
-        .timeout(std::time::Duration::from_secs(8))
+        .proxy(proxy)
+        .connect_timeout(std::time::Duration::from_secs(secs))
+        .timeout(std::time::Duration::from_secs(secs))
         .build()
     else {
         return false;
     };
-    for url in [
-        "http://www.gstatic.com/generate_204",
-        "http://cp.cloudflare.com/generate_204",
-    ] {
-        if let Ok(r) = client.get(url).send() {
-            if r.status().is_success() {
-                return true;
-            }
-        }
-    }
-    false
+    client
+        .get(url)
+        .send()
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+}
+
+// Final gate before leaving the Windows proxy enabled: if the HTTP inbound
+// cannot carry traffic, turn the proxy back off instead of blackholing every
+// app on the machine.
+fn verify_http_proxy() -> bool {
+    probe_url_via_http_proxy("http://www.gstatic.com/generate_204", 6)
+        || probe_url_via_http_proxy("http://cp.cloudflare.com/generate_204", 5)
 }
 
 #[cfg(target_os = "windows")]
 fn system_proxy_is_ours() -> bool {
-    const KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
-    let mut q = std::process::Command::new("reg");
-    q.args(["query", KEY, "/v", "ProxyEnable"]);
-    hide_window(&mut q);
-    let enabled = q
-        .output()
-        .ok()
-        .map(|o| {
-            let s = String::from_utf8_lossy(&o.stdout).to_ascii_lowercase();
-            s.split_whitespace().last().map(|t| t == "0x1").unwrap_or(false)
-        })
+    let enabled = reg_query_value("ProxyEnable")
+        .map(|v| v.value.trim().eq_ignore_ascii_case("0x1"))
         .unwrap_or(false);
     if !enabled {
         return false;
     }
-    let mut q = std::process::Command::new("reg");
-    q.args(["query", KEY, "/v", "ProxyServer"]);
-    hide_window(&mut q);
-    q.output()
-        .ok()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout).contains(&format!("127.0.0.1:{HTTP_PORT}"))
-        })
-        .unwrap_or(false)
+    let is_ours = reg_query_value("ProxyServer")
+        .map(|v| v.value.contains(&format!("127.0.0.1:{HTTP_PORT}")))
+        .unwrap_or(false);
+    if !is_ours {
+        return false;
+    }
+    // A PAC script (another VPN client) would override our manual proxy.
+    reg_query_value("AutoConfigURL")
+        .map(|v| v.value.trim().is_empty())
+        .unwrap_or(true)
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -1542,41 +1571,261 @@ fn start_tun(dns: &str, udp: bool, ipv6: bool) -> Result<(), String> {
     }
 }
 
-fn set_system_proxy(on: bool) {
+#[cfg(target_os = "windows")]
+fn proxy_reg_key() -> &'static str {
+    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+}
+
+// A saved registry value, including its type, so restore is exact.
+#[cfg(target_os = "windows")]
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct RegValue {
+    ty: String,
+    value: String,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct ProxyBackup {
+    proxy_enable: Option<RegValue>,
+    proxy_server: Option<RegValue>,
+    proxy_override: Option<RegValue>,
+    auto_config_url: Option<RegValue>,
+    auto_detect: Option<RegValue>,
+}
+
+fn proxy_backup_path() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|d| d.join("lionray-vpn").join("proxy-backup.json"))
+}
+
+#[cfg(target_os = "windows")]
+fn reg_query_value(name: &str) -> Option<RegValue> {
+    let mut cmd = std::process::Command::new("reg");
+    cmd.args(["query", proxy_reg_key(), "/v", name]);
+    hide_window(&mut cmd);
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        let Some(first) = it.next() else { continue };
+        if !first.eq_ignore_ascii_case(name) {
+            continue;
+        }
+        let Some(ty) = it.next() else { continue };
+        return Some(RegValue {
+            ty: ty.to_string(),
+            value: it.collect::<Vec<_>>().join(" "),
+        });
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn reg_set_value(name: &str, ty: &str, value: &str) -> bool {
+    let mut cmd = std::process::Command::new("reg");
+    cmd.args(["add", proxy_reg_key(), "/v", name, "/t", ty, "/d", value, "/f"]);
+    hide_window(&mut cmd);
+    cmd.output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+#[cfg(target_os = "windows")]
+fn reg_delete_value(name: &str) {
+    let mut cmd = std::process::Command::new("reg");
+    cmd.args(["delete", proxy_reg_key(), "/v", name, "/f"]);
+    hide_window(&mut cmd);
+    let _ = cmd.output();
+}
+
+// Remember the user's proxy configuration exactly once per session, before we
+// change anything. Restoring it on disconnect means LionRay never permanently
+// leaves someone else's PAC/proxy settings mangled.
+#[cfg(target_os = "windows")]
+fn save_proxy_backup() {
+    let Some(path) = proxy_backup_path() else { return };
+    if path.exists() {
+        return;
+    }
+    let server = reg_query_value("ProxyServer");
+    let ours = server
+        .as_ref()
+        .map(|v| v.value.contains(&format!("127.0.0.1:{HTTP_PORT}")))
+        .unwrap_or(false);
+    let backup = ProxyBackup {
+        proxy_enable: reg_query_value("ProxyEnable"),
+        proxy_server: if ours { None } else { server },
+        proxy_override: reg_query_value("ProxyOverride"),
+        auto_config_url: reg_query_value("AutoConfigURL"),
+        auto_detect: reg_query_value("AutoDetect"),
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(s) = serde_json::to_string_pretty(&backup) {
+        let _ = std::fs::write(&path, s);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn restore_reg(name: &str, v: &Option<RegValue>, default_ty: &str) {
+    match v {
+        Some(rv) => {
+            let ty = if rv.ty.is_empty() { default_ty } else { rv.ty.as_str() };
+            reg_set_value(name, ty, &rv.value);
+        }
+        None => reg_delete_value(name),
+    }
+}
+
+// Restoring a proxy/PAC that points at a dead local port would immediately
+// break the internet after disconnect — exactly what we are fixing. Handles
+// both a PAC URL and WinINET's `http=host:port;https=host:port` form.
+#[cfg(target_os = "windows")]
+fn local_target_alive(value: &str) -> bool {
+    let raw = value.trim();
+    if raw.is_empty() {
+        return false;
+    }
+    let mut saw_local = false;
+    for entry in raw.split(';') {
+        let candidate = entry
+            .rsplit_once('=')
+            .map(|(_, v)| v)
+            .unwrap_or(entry)
+            .trim();
+        if candidate.is_empty() {
+            continue;
+        }
+        let lower = candidate.to_ascii_lowercase();
+        let rest = lower.split("://").nth(1).unwrap_or(&lower);
+        let authority = rest
+            .split(['/', '?'])
+            .next()
+            .unwrap_or("")
+            .rsplit('@')
+            .next()
+            .unwrap_or("");
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((h, p)) => (
+                h.trim_start_matches('[').trim_end_matches(']'),
+                p.parse::<u16>().ok(),
+            ),
+            None => (authority, None),
+        };
+        let is_local = matches!(host, "127.0.0.1" | "localhost" | "::1" | "0.0.0.0");
+        if !is_local {
+            // remote proxy/PAC: cannot cheaply verify, assume it is valid
+            continue;
+        }
+        saw_local = true;
+        if let Some(port) = port {
+            if format!("127.0.0.1:{port}")
+                .parse::<std::net::SocketAddr>()
+                .map(|a| {
+                    std::net::TcpStream::connect_timeout(
+                        &a,
+                        std::time::Duration::from_millis(200),
+                    )
+                    .is_ok()
+                })
+                .unwrap_or(false)
+            {
+                return true;
+            }
+        }
+    }
+    // No local target at all (remote only) — treat as valid.
+    !saw_local
+}
+
+#[cfg(target_os = "windows")]
+fn reg_is_on(name: &str) -> bool {
+    reg_query_value(name)
+        .map(|v| {
+            let t = v.value.trim().to_ascii_lowercase();
+            t == "0x1" || t == "1"
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "windows")]
+fn restore_proxy() {
+    let Some(path) = proxy_backup_path() else { return };
+    let backup: Option<ProxyBackup> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok());
+    match backup {
+        Some(b) => {
+            let server_ours = reg_query_value("ProxyServer")
+                .map(|v| v.value.contains(&format!("127.0.0.1:{HTTP_PORT}")))
+                .unwrap_or(false);
+            // TUN takeover leaves ProxyEnable=0 and no PAC. If both are still
+            // true, the settings are ours to restore. If another client set a
+            // proxy/PAC in the meantime, leave its setting alone.
+            let pac_value = reg_query_value("AutoConfigURL");
+            let tun_takeover = !reg_is_on("ProxyEnable") && pac_value.is_none();
+            if server_ours || tun_takeover {
+                let saved_proxy_dead = b
+                    .proxy_server
+                    .as_ref()
+                    .map(|v| !local_target_alive(&v.value))
+                    .unwrap_or(false);
+                let saved_pac = b.auto_config_url.clone().filter(|v| local_target_alive(&v.value));
+                if saved_pac.is_none() && b.auto_config_url.is_some() {
+                    app_log("proxy restore: saved PAC points at a dead local port - skipped");
+                }
+                restore_reg("ProxyServer", &b.proxy_server, "REG_SZ");
+                restore_reg("ProxyOverride", &b.proxy_override, "REG_SZ");
+                restore_reg("AutoConfigURL", &saved_pac, "REG_SZ");
+                restore_reg("AutoDetect", &b.auto_detect, "REG_DWORD");
+                if saved_proxy_dead {
+                    app_log("proxy restore: saved proxy port is dead - leaving proxy off");
+                    reg_set_value("ProxyEnable", "REG_DWORD", "0");
+                } else {
+                    restore_reg("ProxyEnable", &b.proxy_enable, "REG_DWORD");
+                }
+            } else {
+                app_log("proxy restore: another program changed the proxy - left alone");
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+        None => {
+            // No saved state: only clear the proxy when it is our own port.
+            let ours = reg_query_value("ProxyServer")
+                .map(|v| v.value.contains(&format!("127.0.0.1:{HTTP_PORT}")))
+                .unwrap_or(false);
+            if ours {
+                reg_set_value("ProxyEnable", "REG_DWORD", "0");
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn restore_proxy() {
+    take_over_proxy(false);
+}
+
+// Take over WinINET proxy settings for the session.
+//   on=true  -> manual proxy 127.0.0.1:10809 (proxy mode)
+//   on=false -> manual proxy off (TUN mode owns routing)
+// A PAC script left behind by another VPN client is disabled either way: it
+// would override/precede our setting and often points at a dead local port.
+fn take_over_proxy(on: bool) {
     #[cfg(target_os = "windows")]
     {
-        let enable_val = if on { "1" } else { "0" };
-        let mut cmd = std::process::Command::new("reg");
-        cmd.args([
-            "add",
-            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-            "/v",
-            "ProxyEnable",
-            "/t",
-            "REG_DWORD",
-            "/d",
-            enable_val,
-            "/f",
-        ]);
-        hide_window(&mut cmd);
-        let _ = cmd.output();
-
+        save_proxy_backup();
         if on {
-            let mut cmd = std::process::Command::new("reg");
-            cmd.args([
-                "add",
-                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-                "/v",
-                "ProxyServer",
-                "/t",
-                "REG_SZ",
-                "/d",
-                &format!("127.0.0.1:{HTTP_PORT}"),
-                "/f",
-            ]);
-            hide_window(&mut cmd);
-            let _ = cmd.output();
+            reg_set_value("ProxyServer", "REG_SZ", &format!("127.0.0.1:{HTTP_PORT}"));
+            reg_set_value("ProxyEnable", "REG_DWORD", "1");
+        } else {
+            reg_set_value("ProxyEnable", "REG_DWORD", "0");
         }
+        reg_delete_value("AutoConfigURL");
+        reg_set_value("AutoDetect", "REG_DWORD", "0");
     }
     #[cfg(target_os = "macos")]
     {
@@ -1609,6 +1858,26 @@ fn set_system_proxy(on: bool) {
             }
         }
     }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let _ = on;
+    }
+}
+
+// A PAC script pointing at a local port where nothing is listening (left by
+// another VPN/proxy client, or by an old LionRay build) makes Windows send every
+// request to a dead endpoint. It overrides the manual proxy, so the machine
+// looks offline even while our tunnel is perfectly healthy. Remove only the
+// definitively-dead local case; a remote PAC is left alone.
+#[cfg(target_os = "windows")]
+fn clear_dead_local_pac() {
+    let Some(pac) = reg_query_value("AutoConfigURL") else { return };
+    let value = pac.value.trim();
+    if value.is_empty() || local_target_alive(value) {
+        return;
+    }
+    app_log("startup: removed dead local PAC (it would blackhole all browsing)");
+    reg_delete_value("AutoConfigURL");
 }
 
 // A crash, an installer upgrade, or a force-killed core can leave the Windows
@@ -1618,29 +1887,11 @@ fn set_system_proxy(on: bool) {
 // actually connected is never disturbed.
 #[cfg(target_os = "windows")]
 fn restore_stale_proxy() {
+    clear_dead_local_pac();
     if socks_listening() {
         return;
     }
-    let mut cmd = std::process::Command::new("reg");
-    cmd.args([
-        "query",
-        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-        "/v",
-        "ProxyServer",
-    ]);
-    hide_window(&mut cmd);
-    let ours = cmd
-        .output()
-        .ok()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .to_ascii_lowercase()
-                .contains(&format!("127.0.0.1:{HTTP_PORT}"))
-        })
-        .unwrap_or(false);
-    if ours {
-        set_system_proxy(false);
-    }
+    restore_proxy();
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -1976,7 +2227,25 @@ fn establish(
                 let _ = c.wait();
             }
         }
+        restore_proxy();
         return Err("xray could not start - check server settings".into());
+    }
+
+    // Verify the full VLESS/WS path BEFORE touching the machine-wide proxy.
+    // A listening SOCKS port with a dead upstream used to make every app show
+    // "connected but no internet" the moment the proxy was enabled.
+    if !verify_tunnel_ready() {
+        if let Ok(mut g) = CHILD.lock() {
+            if let Some(mut c) = g.take() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+        // A reconnect while the proxy was on must not leave the OS pointed at
+        // the core we just killed.
+        restore_proxy();
+        app_log("connect aborted: tunnel probe failed (proxy left off)");
+        return Err("Server is not responding — Windows proxy was left off".into());
     }
 
     if tun {
@@ -1994,12 +2263,44 @@ fn establish(
         // keep the proxy server reachable outside the tunnel: Xray must dial
         // the real IP directly, not through the TUN adapter sing-box owns
         tunnel_host_route(&dial_server.address);
-        // TUN captures everything; a system proxy on top would double-route
-        // traffic and can leak DNS, so make sure it is off.
-        set_system_proxy(false);
+        // TUN captures everything; a manual proxy or a foreign PAC on top
+        // would double-route traffic and can blackhole the machine.
+        take_over_proxy(false);
+
+        // Verify the adapter actually carries traffic; roll back instead of
+        // leaving every app offline behind a broken TUN.
+        if !verify_tun_ready() {
+            stop_tun();
+            if let Ok(mut g) = CHILD.lock() {
+                if let Some(mut c) = g.take() {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+            }
+            restore_proxy();
+            CONNECTED.store(false, Ordering::SeqCst);
+            app_log("connect aborted: TUN probe failed (rolled back)");
+            return Err("TUN connected but no traffic — rolled back".into());
+        }
     } else {
         clear_tunnel_host_route();
-        set_system_proxy(true);
+        take_over_proxy(true);
+
+        // Last gate: the registry was written and the SOCKS path worked, but
+        // make sure the HTTP inbound (what Windows apps actually use) can also
+        // carry traffic. If not, undo the proxy instead of blackholing the PC.
+        if !system_proxy_is_ours() || !verify_http_proxy() {
+            if let Ok(mut g) = CHILD.lock() {
+                if let Some(mut c) = g.take() {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+            }
+            restore_proxy();
+            CONNECTED.store(false, Ordering::SeqCst);
+            app_log("connect aborted: HTTP proxy probe failed (proxy restored)");
+            return Err("Proxy enabled but no traffic — proxy was turned back off".into());
+        }
     }
 
     set_keep_awake(true);
@@ -2137,8 +2438,8 @@ fn reset_tunnel_state() {
             let _ = c.wait();
         }
     }
-    // always reset, in case a previous run left proxy on
-    set_system_proxy(false);
+    // restore the user's original proxy/PAC values (not just "off")
+    restore_proxy();
     set_keep_awake(false);
     CONNECTED.store(false, Ordering::SeqCst);
 }
@@ -2954,14 +3255,10 @@ pub fn run() {
                         }
                     }
 
-                    // Another app/installer can flip the Windows proxy off;
-                    // restore ours every 60 s so the browser keeps using it.
-                    if !hard_dead && !soft_dead && !net_dead && !tun_needed && tick % 12 == 0 {
-                        if !system_proxy_is_ours() {
-                            app_log("watchdog: system proxy was reset - restoring");
-                            set_system_proxy(true);
-                        }
-                    }
+                    // Do NOT re-enable the Windows proxy here. If the user (or
+                    // another app) turns it off, that is their choice; the old
+                    // "helpful" re-enable made Windows Settings look like the
+                    // VPN kept turning the proxy back on by itself.
 
                     if !hard_dead && !soft_dead && !net_dead {
                         retries = 0;

@@ -1215,7 +1215,7 @@ function App() {
                     ? isAdmin
                       ? "TUN is ready. The system proxy stays off while connected."
                       : "Restart as administrator before connecting."
-                    : "Proxy mode (current): apps that ignore the Windows system proxy are not captured."}
+                    : "Proxy mode (current): the Windows proxy is enabled only while connected and your saved proxy/PAC is restored on disconnect."}
                 </div>
               </>
             )}
