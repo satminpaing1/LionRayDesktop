@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.4";
+pub const APP_VERSION: &str = "1.8.5";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -12,6 +12,9 @@ const API_PORT: u16 = 15490;
 static CHILD: Mutex<Option<std::process::Child>> = Mutex::new(None);
 // sing-box TUN front-end (Windows system-wide capture); None when TUN is off
 static TUN_CHILD: Mutex<Option<std::process::Child>> = Mutex::new(None);
+// Set only when this session actually created TUN state. Lets a normal proxy
+// connect skip the pointless `reg delete HKLM\...\sing-box_tun` process spawn.
+static TUN_DIRTY: AtomicBool = AtomicBool::new(false);
 static CONNECTED: AtomicBool = AtomicBool::new(false);
 // user intent to stay connected — gates the auto-reconnect watchdog so a manual
 // disconnect is never "repaired" by an unwanted auto-reconnect
@@ -33,6 +36,9 @@ struct LastConnect {
 }
 static NETWORKS: Mutex<Option<sysinfo::Networks>> = Mutex::new(None);
 static DL_PROGRESS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+// Startup stale-state cleanup runs on a background thread so the window can
+// paint immediately. `connect` waits for it (short, bounded) before establishing.
+static STARTUP_CLEANUP_DONE: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -172,20 +178,16 @@ fn running_as_admin() -> bool {
 
 // True when the local SOCKS listener xray should be serving is actually up.
 fn socks_listening() -> bool {
-    for _ in 0..3 {
-        if "127.0.0.1:10808"
-            .parse::<std::net::SocketAddr>()
-            .map(|addr| {
-                std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400))
-                    .is_ok()
-            })
-            .unwrap_or(false)
-        {
-            return true;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(150));
-    }
-    false
+    // One quick probe is enough. A transient "busy" core is already handled by
+    // the watchdog's consecutive-dead threshold, so retrying here only added
+    // ~300 ms to every startup probe and every connect readiness check.
+    "127.0.0.1:10808"
+        .parse::<std::net::SocketAddr>()
+        .map(|addr| {
+            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(250))
+                .is_ok()
+        })
+        .unwrap_or(false)
 }
 
 // Runs a blocking HTTP request OFF the async runtime (spawn_blocking) so a
@@ -1236,10 +1238,12 @@ fn stop_tun() {
     // shadow the next session.
     clear_tunnel_host_route();
     // sing-box's default auto_route keeps its routing state in the registry
-    // ("sing-box_tun") and recreates the adapter at boot. If the engine was
-    // killed, that leftover state can blackhole traffic; remove it while the
-    // tunnel is being torn down. The engine re-creates it on the next start.
-    restore_singbox_tun_state();
+    // ("sing-box_tun") and recreates the adapter at boot. Only clean it when a
+    // TUN session actually existed — a plain proxy connect must not pay for a
+    // needless `reg delete` process spawn. Startup still sweeps stale state.
+    if TUN_DIRTY.swap(false, Ordering::SeqCst) || had_child {
+        restore_singbox_tun_state();
+    }
     #[cfg(windows)]
     if had_child {
         std::thread::spawn(sweep_phantom_wintun);
@@ -1377,6 +1381,7 @@ fn start_tun(dns: &str, udp: bool, ipv6: bool) -> Result<(), String> {
 
         let child = cmd.spawn().map_err(|e| format!("Failed to start TUN engine: {e}"))?;
         *TUN_CHILD.lock().map_err(|e| e.to_string())? = Some(child);
+        TUN_DIRTY.store(true, Ordering::SeqCst);
 
         // adapter creation + route programming takes a moment; fail fast if
         // Windows refused (usually because the process is not elevated)
@@ -1385,10 +1390,8 @@ fn start_tun(dns: &str, udp: bool, ipv6: bool) -> Result<(), String> {
             stop_tun();
             return Err("TUN engine exited immediately — administrator rights are required".into());
         }
-
-        // clean up devices left by earlier force-killed sessions (best effort,
-        // never blocks or fails an otherwise healthy connection)
-        std::thread::spawn(sweep_phantom_wintun);
+        // No phantom sweep here: it spawns PowerShell + WMI and is only needed
+        // after a real session ends (stop_tun) or once at app startup.
         Ok(())
     }
 }
@@ -1753,8 +1756,10 @@ fn establish(
     // sleep made the UI spin on slow machines and could race the first
     // request; polling also detects a core that died from a bad config.
     let mut ready = false;
-    for _ in 0..40 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    // 25 ms granularity instead of 100 ms: the core is usually listening in
+    // ~50 ms, so the old loop wasted ~75-100 ms on every single connect.
+    for _ in 0..200 {
+        std::thread::sleep(std::time::Duration::from_millis(25));
         let alive = {
             let mut guard = CHILD.lock().map_err(|e| e.to_string())?;
             match guard.as_mut() {
@@ -1840,6 +1845,14 @@ async fn connect(
     let srv = server.clone();
     let (r2, d2, bp2) = (r.clone(), d.clone(), bp.clone());
     let started = tokio::task::spawn_blocking(move || {
+        // Never let the startup cleanup thread clear the proxy we are about to
+        // enable. It normally finishes in <100 ms, so this is effectively free.
+        for _ in 0..100 {
+            if STARTUP_CLEANUP_DONE.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         establish(
             &srv, &r2, &d2, ab, &bp2, tun_on, udp_on, ipv6_on, fragment_on,
         )
@@ -2649,13 +2662,15 @@ pub fn run() {
             relaunch_as_admin,
         ])
         .setup(|app| {
-            // Heal a dead proxy left by a previous crash before the webview
-            // loads, otherwise the whole machine looks offline.
-            restore_stale_proxy();
-            // Remove a host route left behind by a crashed TUN session.
-            clear_tunnel_host_route();
-            // Remove sing-box's leftover registry routing state.
-            restore_singbox_tun_state();
+            // Heal stale state from a previous crash on a background thread:
+            // these spawn reg/netsh child processes and must not hold up the
+            // first webview paint. `connect` waits for the flag below.
+            std::thread::spawn(|| {
+                restore_stale_proxy();
+                clear_tunnel_host_route();
+                restore_singbox_tun_state();
+                STARTUP_CLEANUP_DONE.store(true, Ordering::Release);
+            });
 
             // Attach a real icon to every window so the running process
             // (taskbar) and the desktop shortcut that Windows ties to it never

@@ -225,8 +225,8 @@ function LiveStats() {
       finally { speedBusy = false; }
     }, 1000);
 
-    // xray session totals (for the "Total" row). This launch of xray.exe is
-    // expensive, so poll it slowly and never overlap calls.
+    // xray session totals spawn a 35 MB CLI process per query — poll sparingly
+    // so the tool stays light. System speed above still updates every second.
     let trafficBusy = false;
     const tpoll = setInterval(() => {
       if (trafficBusy) return;
@@ -235,7 +235,7 @@ function LiveStats() {
         .then((r) => setTotals({ down: r.down, up: r.up }))
         .catch(() => {})
         .finally(() => { trafficBusy = false; });
-    }, 5000);
+    }, 20000);
 
     return () => {
       clearInterval(t);
@@ -353,13 +353,15 @@ function App() {
     document.documentElement.classList.toggle("dark", settings.dark);
   }, [settings.dark]);
 
-  // notify the user when a newer desktop release (new app version / bundled core) is published
+  // notify the user when a newer desktop release is published. Delayed so the
+  // GitHub request never competes with window paint / auto-connect on launch.
   useEffect(() => {
-    invoke<string | null>("check_update")
-      .then((t) => {
-        if (t) setAppUpdate(t);
-      })
-      .catch(() => {});
+    const t = setTimeout(() => {
+      invoke<string | null>("check_update")
+        .then((v) => { if (v) setAppUpdate(v); })
+        .catch(() => {});
+    }, 2500);
+    return () => clearTimeout(t);
   }, []);
 
   const showToast = useCallback((msg: string, bad = false) => {
@@ -454,7 +456,7 @@ function App() {
     if (settings.autoConnect && !connected && !busy) {
       const srv = activeServer ?? servers[0];
       if (srv) {
-        const t = setTimeout(() => doConnect(srv, true), 800);
+        const t = setTimeout(() => doConnect(srv, true), 200);
         return () => clearTimeout(t);
       }
     }
@@ -508,8 +510,8 @@ function App() {
         .catch(() => {})
         .finally(() => { exitBusy = false; });
     };
-    const first = setTimeout(check, 1500);
-    const poll = setInterval(check, 15000);
+    const first = setTimeout(check, 700);
+    const poll = setInterval(check, 20000);
 
     return () => {
       clearTimeout(first);
