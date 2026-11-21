@@ -19,6 +19,7 @@
   --on-green: #FFFFFF;
   --red: #E5484D;
   --red-soft: #FEF1F1;
+  --red-glass: rgba(229, 72, 77, .09);
   --amber: #D97706;
   --shadow-sm: 0 1px 2px rgba(16, 24, 40, .04);
   --shadow: 0 2px 4px rgba(16, 24, 40, .04), 0 14px 32px rgba(16, 24, 40, .08);
@@ -45,6 +46,7 @@
   --on-green: #06281D;
   --red: #F97066;
   --red-soft: #331A1C;
+  --red-glass: rgba(249, 112, 102, .10);
   --amber: #FDB022;
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, .24);
   --shadow: 0 2px 4px rgba(0, 0, 0, .22), 0 16px 36px rgba(0, 0, 0, .28);
@@ -360,13 +362,18 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .home-panel {
   flex-shrink: 0;
   overflow: hidden;
-  border: 1px solid var(--line);
+  border: 1px solid var(--red);
   border-radius: 20px;
-  background: var(--surface);
+  background: var(--red-glass);
+  backdrop-filter: blur(10px) saturate(1.12);
+  -webkit-backdrop-filter: blur(10px) saturate(1.12);
   box-shadow: var(--shadow-sm);
-  transition: border-color .22s;
+  transition: border-color .22s, box-shadow .22s;
 }
-.home-panel.on { border-color: var(--green); box-shadow: 0 0 0 3px var(--green-soft), var(--shadow-sm); }
+.home-panel.on {
+  border-color: var(--green);
+  box-shadow: 0 0 0 3px var(--green-soft), var(--shadow-sm);
+}
 .server-row {
   width: 100%;
   display: flex;
