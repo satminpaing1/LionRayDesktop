@@ -1701,45 +1701,34 @@ function App() {
               <div className="kv"><span>App Version</span><b>{appVer}</b></div>
             </div>
 
-            <div className="sec">Xray Core Update</div>
+            <div className="sec">Xray Core</div>
             <div className="card update-card">
-              {xrayUpdating ? (
-                <div className="update-progress-wrap">
-                  <div className="update-progress-bar">
-                    <div className="update-progress-fill" style={{ width: `${xrayProgress}%` }} />
-                  </div>
-                  <div className="update-progress-text">Downloading… {xrayProgress}%</div>
-                </div>
-              ) : xrayUpdate ? (
-                <>
-                  <div className="kv">
-                    <span>New version available</span>
-                    <b style={{ color: "var(--green)" }}>v{xrayUpdate.version}</b>
-                  </div>
-                  <div className="hr" />
-                  <div className="update-btn-row">
-                    <button className="btn-primary m0" onClick={() => doXrayUpdate(xrayUpdate.url)}>
-                      Update Now
-                    </button>
-                    <button className="btn-secondary" onClick={checkXrayUpdate} aria-label="Refresh"><Icon name="refresh" size={14} /></button>
-                  </div>
-                </>
-              ) : (
-                <>
-                  {xrayCheckMsg && (
-                    <div className="kv">
-                      <span style={{ color: xrayCheckMsg.startsWith("Error") ? "var(--red)" : "var(--sub)" }}>{xrayCheckMsg}</span>
-                    </div>
-                  )}
-                  <button
-                    className="btn-secondary btn-block"
-                    style={{ marginTop: xrayCheckMsg ? 0 : 8 }}
-                    onClick={checkXrayUpdate}
-                  >
-                    <Icon name="refresh" size={13} /> Check for updates
-                  </button>
-                </>
-              )}
+              <div className="kv">
+                <span>Installed core</span>
+                <b>v{coreVer}</b>
+              </div>
+              <div className="hr" />
+              <div className="kv">
+                <span style={{ color: "var(--sub)" }}>
+                  Pinned to v26.3.27 — newer builds break WebSocket connections on these servers.
+                </span>
+              </div>
+              <div className="update-btn-row">
+                <button
+                  className="btn-secondary btn-block"
+                  onClick={async () => {
+                    try {
+                      const v = await invoke<string>("rollback_xray_core");
+                      setCoreVer(v);
+                      showToast(`Restored validated core v${v} — restart the app to use it`);
+                    } catch (e: any) {
+                      showToast(typeof e === "string" ? e : "Restore failed", true);
+                    }
+                  }}
+                >
+                  <Icon name="refresh" size={13} /> Restore validated core
+                </button>
+              </div>
             </div>
 
             <div className="sec">Community</div>

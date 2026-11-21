@@ -4,7 +4,12 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.46";
+pub const APP_VERSION: &str = "1.8.47";
+// The only Xray build validated against VLESS/WS + TLS on Cloudflare. Newer
+// builds (26.11.x) fail the WebSocket upgrade against our users' servers with
+// "transport/internet/websocket: failed to dial ... > EOF". The in-app updater
+// must never install a different version, and startup heals back to this one.
+const VALIDATED_XRAY_VERSION: &str = "26.3.27";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -27,6 +32,9 @@ static LAST: Mutex<Option<LastConnect>> = Mutex::new(None);
 // consecutive tunnel probe failures (keep-warm); triggers auto-reconnect at 3
 static TUNNEL_FAILS: AtomicU32 = AtomicU32::new(0);
 static RECONNECTING: AtomicBool = AtomicBool::new(false);
+// Do not churn the core: a bad core or a flaky CDN must not produce a restart
+// every few seconds, which is far worse for the user than a brief stall.
+static LAST_CORE_REFRESH: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 
 #[derive(Clone)]
 struct LastConnect {
@@ -225,6 +233,20 @@ fn start_tunnel_keepalive() {
                 continue;
             }
             TUNNEL_FAILS.store(0, Ordering::SeqCst);
+
+            // Recovery cooldown: never churn the core/connection more than
+            // once every 2 minutes. Repeated restarts are what actually make
+            // browsing feel slow, far worse than a brief stalled request.
+            {
+                let mut last = LAST_CORE_REFRESH.lock().unwrap_or_else(|e| e.into_inner());
+                let now = std::time::Instant::now();
+                if let Some(t) = *last {
+                    if now.duration_since(t) < std::time::Duration::from_secs(120) {
+                        continue;
+                    }
+                }
+                *last = Some(now);
+            }
 
             // Step 1: transparent core refresh. The local proxy port keeps
             // answering the whole time, so apps and the UI see no flip.
@@ -2248,7 +2270,25 @@ fn is_elevated() -> bool {
     running_as_admin()
 }
 
-// Restart the app (used after xray core update so the new binary takes effect).
+// Older builds let the in-app updater install a newer Xray that breaks the
+// WebSocket upgrade on Cloudflare-fronted servers. Heal silently at startup so
+// the user never has to know a bad core was installed.
+fn heal_pinned_core_at_startup() {
+    let current = get_core_version_sync()
+        .unwrap_or_default()
+        .trim()
+        .trim_start_matches('v')
+        .trim_start_matches('V')
+        .to_string();
+    if current == VALIDATED_XRAY_VERSION {
+        return;
+    }
+    match rollback_xray_core() {
+        Ok(ver) => app_log(&format!("startup: restored validated Xray core {ver} (was {current})")),
+        Err(e) => app_log(&format!("startup: core version {current} is not validated ({e})")),
+    }
+}
+
 // Roll back the xray core to the .bak files created during the last update.
 #[tauri::command]
 fn rollback_xray_core() -> Result<String, String> {
@@ -3219,6 +3259,14 @@ async fn check_xray_core_update() -> Result<Option<Value>, String> {
 
     // strip "v" prefix for comparison
     let remote_ver = tag.trim_start_matches('v').trim_start_matches('V').to_string();
+
+    // Only the validated core is offered. Newer Xray releases break VLESS/WS
+    // on Cloudflare for our servers (WS upgrade returns EOF), which showed up
+    // as a "connected but no internet / very slow" tunnel. Never suggest one.
+    if remote_ver != VALIDATED_XRAY_VERSION {
+        return Ok(None);
+    }
+
     let cur = tokio::task::spawn_blocking(get_core_version_sync)
         .await
         .ok()
@@ -3871,6 +3919,9 @@ pub fn run() {
             // first webview paint. `connect` waits for the flag below.
             std::thread::spawn(|| {
                 app_log(&format!("app start v{}", APP_VERSION));
+                // Heal a bad core installed by the old in-app updater before
+                // any connect can pick it up.
+                heal_pinned_core_at_startup();
                 restore_stale_proxy();
                 clear_tunnel_host_route();
                 restore_singbox_tun_state();
@@ -3896,12 +3947,9 @@ pub fn run() {
             #[cfg(windows)]
             std::thread::spawn(sweep_phantom_wintun);
 
-            // Tiny keep-warm requests only — NOT a reconnect watchdog. Older
-            // releases (1.8.x) probed and re-established on any soft failure,
-            // which on a slow-but-healthy line caused self-triggered drop /
-            // reconnect loops. This restores the calm v1.6.0 behaviour: the
-            // connection stays up until the user disconnects or the core
-            // genuinely exits, and `is_connected()` reflects that.
+            // Keep-warm + guarded auto-recovery. A single slow probe never
+            // triggers a restart; repeated failures need a 2-minute cooldown,
+            // so a healthy line is never churned into a reconnect loop.
             start_tunnel_keepalive();
             Ok(())
         })
