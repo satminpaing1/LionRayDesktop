@@ -84,41 +84,162 @@ type LogLevel = "all" | "warn" | "error";
 type SheetMode = null | "menu" | "sub";
 
 const PROTO_COLORS: Record<string, string> = { vless: "#6366F1", trojan: "#F59E0B", shadowsocks: "#10B981" };
+const protoLabel = (p?: string): string => {
+  const key = (p || "").toLowerCase();
+  if (key === "shadowsocks") return "SS";
+  if (key === "vless") return "VLESS";
+  if (key === "vmess") return "VMESS";
+  if (key === "trojan") return "TROJAN";
+  return (p || "???").slice(0, 4).toUpperCase();
+};
 // App Version is read from Tauri at runtime (the appVer state) so the
 // Settings screen always shows the real, stamped build version.
 let idCounter = Date.now() % 100000;
 
 const pingColor = (ms: number | null): string =>
-  ms === null ? "var(--sub)" : ms < 0 ? "#EF4444" : ms < 150 ? "#22C55E" : ms < 350 ? "#F59E0B" : "#EF4444";
+  ms === null ? "var(--sub)" : ms < 0 ? "#EF4444" : ms < 150 ? "#10B981" : ms < 350 ? "#F59E0B" : "#EF4444";
+
+type IconName =
+  | "shield" | "home" | "globe" | "layers" | "terminal" | "sliders"
+  | "power" | "download" | "upload" | "server" | "chevron" | "arrow-left"
+  | "plus" | "refresh" | "copy" | "trash" | "search" | "close"
+  | "camera" | "image" | "clipboard" | "link" | "edit" | "share"
+  | "more" | "timer" | "check" | "lock";
+
+// One consistent line-icon set instead of multicolour emoji, so the whole
+// window reads as one calm surface.
+function Icon({ name, size = 20, strokeWidth = 1.8 }: { name: IconName; size?: number; strokeWidth?: number }) {
+  let body: React.ReactNode;
+  switch (name) {
+    case "shield":
+      body = <><path d="M12 3l7 3v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6l7-3Z" /><path d="m9.5 12 1.7 1.7 3.3-3.4" /></>;
+      break;
+    case "home":
+      body = <><path d="m3 10.5 9-7.5 9 7.5" /><path d="M5.5 9.5V20a1 1 0 0 0 1 1H10v-5h4v5h3.5a1 1 0 0 0 1-1V9.5" /></>;
+      break;
+    case "globe":
+      body = <><circle cx="12" cy="12" r="8.5" /><path d="M3.5 12h17" /><path d="M12 3.5c2.4 2.3 3.6 5.1 3.6 8.5S14.4 18.2 12 20.5c-2.4-2.3-3.6-5.1-3.6-8.5S9.6 5.8 12 3.5Z" /></>;
+      break;
+    case "layers":
+      body = <><path d="m12 3 9 5-9 5-9-5 9-5Z" /><path d="m3 12 9 5 9-5" /><path d="m3 16 9 5 9-5" /></>;
+      break;
+    case "terminal":
+      body = <><rect x="3" y="4.5" width="18" height="15" rx="3" /><path d="m7 9 3 3-3 3" /><path d="M13 15h4" /></>;
+      break;
+    case "sliders":
+      body = <><path d="M4 7h3" /><circle cx="9" cy="7" r="2" /><path d="M11 7h9" /><path d="M4 17h7" /><circle cx="13" cy="17" r="2" /><path d="M15 17h5" /></>;
+      break;
+    case "power":
+      body = <><path d="M12 3v9" /><path d="M6.4 6.4a8 8 0 1 0 11.2 0" /></>;
+      break;
+    case "download":
+      body = <><path d="M12 3v12" /><path d="m7.5 10.5 4.5 4.5 4.5-4.5" /><path d="M4 20h16" /></>;
+      break;
+    case "upload":
+      body = <><path d="M12 16V4" /><path d="m7.5 8.5 4.5-4.5 4.5 4.5" /><path d="M4 20h16" /></>;
+      break;
+    case "server":
+      body = <><rect x="3" y="4" width="18" height="7" rx="2" /><rect x="3" y="13" width="18" height="7" rx="2" /><path d="M7 7.5h.01M7 16.5h.01" /></>;
+      break;
+    case "chevron":
+      body = <path d="m9 5 7 7-7 7" />;
+      break;
+    case "arrow-left":
+      body = <><path d="M19 12H5" /><path d="m11 18-6-6 6-6" /></>;
+      break;
+    case "plus":
+      body = <path d="M12 5v14M5 12h14" />;
+      break;
+    case "refresh":
+      body = <><path d="M20 11a8 8 0 1 0-2.3 5.7" /><path d="M20 4v7h-7" /></>;
+      break;
+    case "copy":
+      body = <><rect x="9" y="9" width="11" height="11" rx="2" /><path d="M15 9V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h3" /></>;
+      break;
+    case "trash":
+      body = <><path d="M4 7h16" /><path d="M9 7V4h6v3" /><path d="m6.5 7 1 13h9l1-13" /><path d="M10 11v5M14 11v5" /></>;
+      break;
+    case "search":
+      body = <><circle cx="11" cy="11" r="6.5" /><path d="m16 16 4 4" /></>;
+      break;
+    case "close":
+      body = <path d="m6 6 12 12M18 6 6 18" />;
+      break;
+    case "camera":
+      body = <><path d="M4 8h3l1.5-2h7L17 8h3a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1Z" /><circle cx="12" cy="13" r="3.2" /></>;
+      break;
+    case "image":
+      body = <><rect x="3" y="4" width="18" height="16" rx="2" /><circle cx="8.5" cy="9" r="1.5" /><path d="m21 16-5-5L5 20" /></>;
+      break;
+    case "clipboard":
+      body = <><rect x="5" y="4" width="14" height="17" rx="2" /><path d="M9 4V3h6v1" /><path d="M8.5 9h7M8.5 13h7M8.5 17h4" /></>;
+      break;
+    case "link":
+      body = <><path d="M10 13a5 5 0 0 0 7.5.5l2-2a5 5 0 0 0-7-7l-1.2 1.2" /><path d="M14 11a5 5 0 0 0-7.5-.5l-2 2a5 5 0 0 0 7 7l1.2-1.2" /></>;
+      break;
+    case "edit":
+      body = <><path d="M4 20h4l10-10-4-4L4 16v4Z" /><path d="m13.5 6.5 4 4" /></>;
+      break;
+    case "share":
+      body = <><path d="M14 4h6v6" /><path d="m20 4-9 9" /><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5" /></>;
+      break;
+    case "more":
+      body = <><circle cx="5" cy="12" r="1.2" fill="currentColor" stroke="none" /><circle cx="12" cy="12" r="1.2" fill="currentColor" stroke="none" /><circle cx="19" cy="12" r="1.2" fill="currentColor" stroke="none" /></>;
+      break;
+    case "timer":
+      body = <><circle cx="12" cy="13" r="8" /><path d="M12 9v4l2.5 1.5" /><path d="M9 3h6" /></>;
+      break;
+    case "check":
+      body = <path d="m5 12.5 4.5 4.5L19 7.5" />;
+      break;
+    case "lock":
+      body = <><rect x="4.5" y="10" width="15" height="10.5" rx="2.5" /><path d="M8 10V7.5a4 4 0 0 1 8 0V10" /></>;
+      break;
+  }
+  return (
+    <svg
+      width={size} height={size} viewBox="0 0 24 24" aria-hidden="true"
+      fill="none" stroke="currentColor" strokeWidth={strokeWidth}
+      strokeLinecap="round" strokeLinejoin="round"
+    >
+      {body}
+    </svg>
+  );
+}
 
 interface ServerRowProps {
   s: Server;
   selected: boolean;
   onSelect: (id: number) => void;
   onPing: (id: number) => void;
-  onEdit: (s: Server) => void;
-  onShare: (s: Server) => void;
-  onRemove: (id: number) => void;
+  onMenu: (s: Server) => void;
 }
 
 // memoized: only re-renders when its own `s` / `selected` / handlers change
-const ServerRow = React.memo(function ServerRow({ s, selected, onSelect, onPing, onEdit, onShare, onRemove }: ServerRowProps) {
+const ServerRow = React.memo(function ServerRow({ s, selected, onSelect, onPing, onMenu }: ServerRowProps) {
   return (
     <div className={`row ${selected ? "sel" : ""}`} onClick={() => onSelect(s.id)}>
       <span className={`radio ${selected ? "on" : ""}`} />
-      <span className="proto-chip" style={{ background: PROTO_COLORS[s.protocol] || "#888" }}>
-        {s.protocol === "shadowsocks" ? "SS" : (s.protocol || "???").slice(0, 3).toUpperCase()}
+      <span
+        className="proto-chip"
+        style={{
+          background: `${PROTO_COLORS[s.protocol] || "#64748B"}14`,
+          color: PROTO_COLORS[s.protocol] || "#64748B",
+          borderColor: `${PROTO_COLORS[s.protocol] || "#64748B"}26`,
+        }}
+      >
+        {protoLabel(s.protocol)}
       </span>
       <div className="row-main">
         <div className="row-name">{s.name || "Unnamed"}</div>
-        <div className="row-meta">**** · {(s.security || "none").toUpperCase()} · {(s.network || "tcp").toUpperCase()}</div>
+        <div className="row-meta">{(s.security || "none").toUpperCase()} · {(s.network || "tcp").toUpperCase()}</div>
       </div>
       <span className="ping-val" style={{ color: pingColor(s.ping) }} onClick={(e) => { e.stopPropagation(); onPing(s.id); }}>
         {s.ping == null ? "—" : s.ping < 0 ? "ERR" : `${s.ping}`}
       </span>
-      <button className="row-act" title="Edit" onClick={(e) => { e.stopPropagation(); onEdit(s); }}>✎</button>
-      <button className="row-act" title="Share" onClick={(e) => { e.stopPropagation(); onShare(s); }}>📤</button>
-      <button className="row-del" onClick={(e) => { e.stopPropagation(); onRemove(s.id); }}>✕</button>
+      <button className="row-more" title="More actions" onClick={(e) => { e.stopPropagation(); onMenu(s); }}>
+        <Icon name="more" size={16} />
+      </button>
     </div>
   );
 });
@@ -247,26 +368,20 @@ function LiveStats() {
   }, []);
 
   return (
-    <>
-      <div className="power-sub">Session {fmtTime(elapsed)}</div>
-      <div className="speed-row">
-        <div className="speed-box down">
-          <span className="speed-ico">⬇</span>
-          <b className="speed-val">{speeds.down}</b>
-          <small>DOWNLOAD</small>
-        </div>
-        <div className="speed-box up">
-          <span className="speed-ico up">⬆</span>
-          <b className="speed-val">{speeds.up}</b>
-          <small>UPLOAD</small>
-        </div>
+    <div className="stat-grid">
+      <div className="stat">
+        <span className="stat-label"><Icon name="download" size={12} /> Download</span>
+        <b className="stat-val">{speeds.down}</b>
       </div>
-      {(totals.down > 0 || totals.up > 0) && (
-        <div className="usage-line">
-          Via VPN ⬇ {fmtBytes(totals.down)} · ⬆ {fmtBytes(totals.up)}
-        </div>
-      )}
-    </>
+      <div className="stat">
+        <span className="stat-label"><Icon name="upload" size={12} /> Upload</span>
+        <b className="stat-val">{speeds.up}</b>
+      </div>
+      <div className="stat" title={`This session: ${fmtBytes(totals.down)} down · ${fmtBytes(totals.up)} up`}>
+        <span className="stat-label"><Icon name="timer" size={12} /> Session</span>
+        <b className="stat-val">{fmtTime(elapsed)}</b>
+      </div>
+    </div>
   );
 }
 
@@ -318,6 +433,7 @@ function App() {
   // auto-reconnect doesn't fire on the brief "xray is dead" window
   const manualDisconnectRef = useRef(false);
   const [editing, setEditing] = useState<Server | null>(null);
+  const [menuServer, setMenuServer] = useState<Server | null>(null);
   const [ef, setEf] = useState<Partial<Server>>({});
   const [sharing, setSharing] = useState<{ srv: Server; uri: string } | null>(null);
   const [qrUrl, setQrUrl] = useState("");
@@ -459,7 +575,8 @@ function App() {
     const raw = logs[logKind];
     if (!raw) return { shownLines: [] as { n: number; text: string; cls: string }[], totalLines: 0 };
     const q = logQuery.trim().toLowerCase();
-    const all = raw.split("\n");
+    const all = raw.replace(/\r\n?/g, "\n").split("\n");
+    while (all.length && all[all.length - 1].trim() === "") all.pop();
     const picked: { n: number; text: string; cls: string }[] = [];
     for (let i = 0; i < all.length; i++) {
       const text = all[i].replace(/\u001b\[[0-9;?]*[A-Za-z]/g, "");
@@ -1080,8 +1197,14 @@ function App() {
     });
   };
 
+  const routingLabel =
+    settings.routing === "global" ? "Global" : settings.routing === "cn" ? "Bypass CN" : "Bypass LAN";
   const RoutingIcon = () => (
-    <span className="route-chip">{settings.routing === "global" ? "🌍 Global" : settings.routing === "cn" ? "🇨🇳 Bypass CN" : "🏠 Bypass LAN"}</span>
+    <button className="route-chip" onClick={() => setTab("settings")} title="Routing mode">
+      <Icon name="globe" size={13} />
+      {routingLabel}
+      <Icon name="chevron" size={11} />
+    </button>
   );
 
   return (
@@ -1100,7 +1223,9 @@ function App() {
             })
           }
         >
-          ⬆ New version {appUpdate} available — tap to download
+          <Icon name="download" size={14} />
+          New version {appUpdate} available
+          <Icon name="chevron" size={12} />
         </div>
       )}
 
@@ -1109,89 +1234,97 @@ function App() {
         <>
           <header className="topbar home-top">
             <div className="brand">
-              <div className="brand-mark">🦁</div>
+              <div className="brand-mark"><Icon name="shield" size={18} /></div>
               <div className="brand-text">
                 <span className="logo">LionRay</span>
-                <small>VPN · SECURE TUNNEL</small>
+                <small>VPN</small>
               </div>
             </div>
             <RoutingIcon />
           </header>
 
           <div className="home-body">
-            <div className="home-greeting">
-              <span>{connected ? "🛡️" : "👋"}</span>
-              <div>
-                <b>{connected ? "You're protected" : "Ready when you are"}</b>
-                <small>
-                  {connected
-                    ? "Your traffic is routed securely"
-                    : "Pick a node, then tap connect"}
-                </small>
-              </div>
-            </div>
-
-            {/* node card */}
-            <div className={`node-card ${connected ? "live" : ""}`} onClick={() => setTab("servers")}>
-              <div className="node-avatar">
-                {activeServer && connected && exitInfo?.countryCode
-                  ? flagEmoji(exitInfo.countryCode)
-                  : "🌐"}
-              </div>
-              <div className="node-left">
-                <div className="node-name">
-                  {activeServer ? activeServer.name : "Select a node"}
-                </div>
-                <div className="node-meta">
-                  {activeServer
-                    ? `${activeServer.protocol.toUpperCase()} · ****:${activeServer.port}`
-                    : "Tap here or + to add"}
-                </div>
-              </div>
-              <div className="node-right" style={{ color: pingColor(activeServer?.ping ?? null) }}>
-                {activeServer?.ping != null && activeServer.ping >= 0 ? `${activeServer.ping}ms` : ""}
-                <span className="node-arrow">›</span>
-              </div>
-            </div>
-
-            {/* power hero */}
-            <div className={`power-zone ${connected ? "is-on" : ""}`}>
-              <div className="hero-orb a" />
-              <div className="hero-orb b" />
-              <div className="status-pill">
-                <span className="status-dot" />
-                {connected ? "PROTECTED" : "UNPROTECTED"}
-              </div>
+            <section className={`status-stage ${connected ? "on" : ""}`}>
               <div className="power-wrap">
-                {connected && <div className="ring r1" />}
-                {connected && <div className="ring r2" />}
-                <button className={`power ${connected ? "on" : ""}`} disabled={busy} onClick={toggleConnect}>
-                  {busy ? <span className="power-busy">…</span> : connected ? "⏹" : "▶"}
+                <button
+                  className={`power ${connected ? "on" : ""}`}
+                  disabled={busy}
+                  onClick={toggleConnect}
+                  aria-label={connected ? "Disconnect" : "Connect"}
+                >
+                  {busy ? <span className="power-busy" /> : <Icon name="power" size={40} strokeWidth={1.7} />}
                 </button>
               </div>
-              <div className={`power-state ${connected ? "on" : ""}`}>
-                {connected ? "CONNECTED" : "NOT CONNECTED"}
+
+              <div className={`hero-status ${connected ? "on" : ""}`}>
+                <span className="status-dot" />
+                <b>{connected ? "Connected" : "Not connected"}</b>
               </div>
-              <div className="power-sub">
+              <p className="hero-sub">
                 {connected
                   ? settings.tunMode
-                    ? "TUN active — all PC traffic"
-                    : "VPN tunnel active"
+                    ? "Every app on this PC is routed through the encrypted tunnel."
+                    : "Your browser and apps are using the secure tunnel."
                   : settings.autoConnect
-                    ? "Auto-connect enabled"
-                    : "Tap the button to connect"}
-              </div>
+                    ? "Auto-connect is on. Tap the power button to start now."
+                    : "Pick a server below, then tap the power button."}
+              </p>
+            </section>
 
-              {connected && <LiveStats />}
+            <section className="home-panel">
+              <button className={`server-row ${connected ? "on" : ""}`} onClick={() => setTab("servers")}>
+                <span className={`server-avatar ${connected ? "on" : ""}`}>
+                  {activeServer && connected && exitInfo?.countryCode
+                    ? flagEmoji(exitInfo.countryCode)
+                    : <Icon name="server" size={17} />}
+                </span>
+                <span className="server-info">
+                  <span className="server-name">
+                    {activeServer ? activeServer.name : "Choose a server"}
+                  </span>
+                  <span className="server-meta">
+                    {activeServer
+                      ? `${activeServer.protocol.toUpperCase()} · ${(activeServer.network || "tcp").toUpperCase()} · ${activeServer.port}`
+                      : "No server selected yet"}
+                  </span>
+                </span>
+                <span className="server-end">
+                  {activeServer?.ping != null && activeServer.ping >= 0 && (
+                    <span className="ping-pill" style={{ color: pingColor(activeServer.ping) }}>
+                      {activeServer.ping} ms
+                    </span>
+                  )}
+                  <Icon name="chevron" size={15} />
+                </span>
+              </button>
 
-              {connected && exitInfo?.query && (
-                <div className="exit-chip" title={exitInfo.isp || ""}>
-                  <span className="exit-flag">{flagEmoji(exitInfo.countryCode)}</span>
-                  <b>{exitInfo.query}</b>
-                  <span className="exit-loc">{[exitInfo.city, exitInfo.country].filter(Boolean).join(", ")}</span>
-                </div>
+              {connected ? (
+                <>
+                  <div className="panel-sep" />
+                  <LiveStats />
+                  {exitInfo?.query && (
+                    <>
+                      <div className="panel-sep" />
+                      <div className="exit-row" title={exitInfo.isp || ""}>
+                        <span className="exit-flag">{flagEmoji(exitInfo.countryCode)}</span>
+                        <span className="exit-text">Exit IP <b>{exitInfo.query}</b></span>
+                        <span className="exit-loc">
+                          {[exitInfo.city, exitInfo.country].filter(Boolean).join(", ")}
+                        </span>
+                      </div>
+                    </>
+                  )}
+                </>
+              ) : (
+                <>
+                  <div className="panel-sep" />
+                  <div className="panel-note">
+                    <Icon name="lock" size={14} />
+                    <span>Tunnel is off — traffic goes direct until you connect.</span>
+                  </div>
+                </>
               )}
-            </div>
+            </section>
           </div>
         </>
       )}
@@ -1200,65 +1333,71 @@ function App() {
       {tab === "servers" && (
         <>
           <header className="topbar">
-            <button className="back-btn" onClick={() => setTab("home")}>‹</button>
-            <span className="topbar-title">Nodes · {servers.length}</span>
+            <button className="back-btn" onClick={() => setTab("home")} aria-label="Back"><Icon name="arrow-left" size={17} /></button>
+            <span className="topbar-title">Nodes</span>
+            {servers.length > 0 && <span className="topbar-count">{servers.length}</span>}
             <div className="tb-actions">
               <button className="sel-btn" onClick={autoSelect} disabled={!servers.length || selBusy}>
-                ✨ Auto Select
+                <Icon name="refresh" size={13} /> Auto
               </button>
-              <button className="test-btn" onClick={pingAll} disabled={!servers.length}>⚡ Test</button>
+              <button className="test-btn" onClick={pingAll} disabled={!servers.length}>Test all</button>
             </div>
           </header>
           <div className="content">
             {servers.length === 0 ? (
               <div className="empty">
-                <div className="empty-icon">📡</div>
+                <div className="empty-icon"><Icon name="server" size={27} /></div>
                 <div>No nodes yet</div>
-                <small>Tap + to import via clipboard / QR / subscription</small>
+                <small>Tap + to import via clipboard, QR, or subscription.</small>
               </div>
             ) : (
               <div className="list">
                 {manualServers.length > 0 && (
-                  <>
-                    <div className="group-label">🔑 My Keys · {manualServers.length}</div>
-                    {manualServers.map((s) => (
-                      <ServerRow
-                        key={s.id}
-                        s={s}
-                        selected={s.id === activeId}
-                        onSelect={setActiveId}
-                        onPing={pingOne}
-                        onEdit={startEdit}
-                        onShare={startShare}
-                        onRemove={removeServer}
-                      />
-                    ))}
-                  </>
-                )}
-                {subs.map((sub) => {
-                  const srv = servers.filter((x) => x.subId === sub.id);
-                  if (srv.length === 0 && !sub.loading) return null;
-                  return (
-                    <div key={`g-${sub.id}`}>
-                      <div className="group-label">
-                        <span>🔗 {sub.name} {sub.loading && <span className="loading-dots">…</span>}</span>
-                        <span className="group-right">
-                          <span className="group-count">{sub.loading ? "…" : srv.length}</span>
-                          <button className="group-del" title="Delete whole profile" onClick={() => deleteSubscription(sub.id)}>🗑</button>
-                        </span>
-                      </div>
-                      {srv.map((s) => (
+                  <div className="node-group">
+                    <div className="group-label">
+                      <span>My keys</span>
+                      <span className="group-right"><span className="group-count">{manualServers.length}</span></span>
+                    </div>
+                    <div className="group-body">
+                      {manualServers.map((s) => (
                         <ServerRow
                           key={s.id}
                           s={s}
                           selected={s.id === activeId}
                           onSelect={setActiveId}
                           onPing={pingOne}
-                          onEdit={startEdit}
-                          onShare={startShare}
-                          onRemove={removeServer}
+                          onMenu={setMenuServer}
                         />
                       ))}
+                    </div>
+                  </div>
+                )}
+                {subs.map((sub) => {
+                  const srv = servers.filter((x) => x.subId === sub.id);
+                  if (srv.length === 0 && !sub.loading) return null;
+                  return (
+                    <div key={`g-${sub.id}`} className="node-group">
+                      <div className="group-label">
+                        <span>{sub.name} {sub.loading && <span className="loading-dots">…</span>}</span>
+                        <span className="group-right">
+                          <span className="group-count">{sub.loading ? "…" : srv.length}</span>
+                          <button className="group-del" title="Delete whole profile" onClick={() => deleteSubscription(sub.id)}><Icon name="trash" size={13} /></button>
+                        </span>
+                      </div>
+                      <div className="group-body">
+                        {srv.length === 0 ? (
+                          <div className="group-empty">Fetching nodes…</div>
+                        ) : srv.map((s) => (
+                          <ServerRow
+                            key={s.id}
+                            s={s}
+                            selected={s.id === activeId}
+                            onSelect={setActiveId}
+                            onPing={pingOne}
+                            onMenu={setMenuServer}
+                          />
+                        ))}
+                      </div>
                     </div>
                   );
                 })}
@@ -1272,31 +1411,36 @@ function App() {
       {tab === "subs" && (
         <>
           <header className="topbar">
-            <button className="back-btn" onClick={() => setTab("home")}>‹</button>
-            <span className="topbar-title">Subscriptions · {subs.length}</span>
+            <button className="back-btn" onClick={() => setTab("home")} aria-label="Back"><Icon name="arrow-left" size={17} /></button>
+            <span className="topbar-title">Subscriptions</span>
+            {subs.length > 0 && <span className="topbar-count">{subs.length}</span>}
             <span style={{ width: 46 }} />
           </header>
           <div className="content">
             {subs.length === 0 ? (
               <div className="empty">
-                <div className="empty-icon">🔗</div>
+                <div className="empty-icon"><Icon name="layers" size={27} /></div>
                 <div>No subscriptions</div>
-                <small>Tap + → Subscriptions to add one</small>
+                <small>Tap + to add a subscription link.</small>
               </div>
             ) : (
-              <div className="list">
+              <div className="sub-list">
                 {subs.map((sub) => {
                   const count = servers.filter((s) => s.subId === sub.id).length;
                   return (
                     <div key={sub.id} className="sub-card">
-                      <div className="sub-head">
+                      <span className="sub-avatar"><Icon name="layers" size={17} /></span>
+                      <div className="sub-main">
                         <div className="sub-name">{sub.name} {sub.loading && <span className="loading-dots">…</span>}</div>
-                        <span className="sub-count">{sub.loading ? "…" : count}</span>
+                        <div className="sub-url" title={sub.url}>{hostOf(sub.url)} · {sub.loading ? "updating" : `${count} ${count === 1 ? "node" : "nodes"}`}</div>
                       </div>
-                      <div className="sub-url">{sub.url}</div>
                       <div className="sub-actions">
-                        <button className="mini-btn primary" disabled={sub.loading} onClick={() => updateSubscription(sub)}>⟳ Update</button>
-                        <button className="mini-btn danger" disabled={sub.loading} onClick={() => deleteSubscription(sub.id)}>🗑 Delete</button>
+                        <button className="sub-btn" title="Update subscription" disabled={sub.loading} onClick={() => updateSubscription(sub)}>
+                          <Icon name="refresh" size={14} />
+                        </button>
+                        <button className="sub-btn danger" title="Delete subscription" disabled={sub.loading} onClick={() => deleteSubscription(sub.id)}>
+                          <Icon name="trash" size={14} />
+                        </button>
                       </div>
                     </div>
                   );
@@ -1311,7 +1455,7 @@ function App() {
       {tab === "settings" && (
         <>
           <header className="topbar">
-            <button className="back-btn" onClick={() => setTab("home")}>‹</button>
+            <button className="back-btn" onClick={() => setTab("home")} aria-label="Back"><Icon name="arrow-left" size={17} /></button>
             <span className="topbar-title">Settings</span>
             <span style={{ width: 46 }} />
           </header>
@@ -1319,9 +1463,9 @@ function App() {
             <div className="sec">Routing Mode</div>
             <div className="card seg-card">
               {([
-                ["global", "🌍 Global"],
-                ["lan", "🏠 Skip LAN"],
-                ["cn", "🇨🇳 Skip CN"],
+                ["global", "Global"],
+                ["lan", "Skip LAN"],
+                ["cn", "Skip CN"],
               ] as const).map(([v, label]) => (
                 <button
                   key={v}
@@ -1340,7 +1484,7 @@ function App() {
                 <div className="card">
                   <div className="toggle-row">
                     <div>
-                      <div className="kv-t">🖥️ TUN Mode</div>
+                      <div className="kv-t">TUN Mode</div>
                       <div className="kv-s">Capture every PC app, even ones that ignore the system proxy</div>
                     </div>
                     <label className="switch">
@@ -1357,7 +1501,7 @@ function App() {
                       <div className="hr" />
                       <div className="tun-admin-row">
                         <div className="kv-s">Administrator access is required to create the virtual adapter.</div>
-                        <button className="btn-secondary" onClick={requestAdmin}>🔐 Restart as Admin</button>
+                        <button className="btn-secondary" onClick={requestAdmin}>Restart as Admin</button>
                       </div>
                     </>
                   )}
@@ -1376,7 +1520,7 @@ function App() {
             <div className="card">
               <div className="toggle-row">
                 <div>
-                  <div className="kv-t">🛡️ Ad Blocker</div>
+                  <div className="kv-t">Ad Blocker</div>
                   <div className="kv-s">Block ads & trackers (geosite filter)</div>
                 </div>
                 <label className="switch">
@@ -1387,7 +1531,7 @@ function App() {
               <div className="hr" />
               <div className="toggle-row">
                 <div>
-                  <div className="kv-t">🌐 DNS Server</div>
+                  <div className="kv-t">DNS Server</div>
                   <div className="kv-s">DNS resolver for domain lookups</div>
                 </div>
                 <select
@@ -1409,7 +1553,7 @@ function App() {
             <div className="card">
               <div className="toggle-row">
                 <div>
-                  <div className="kv-t">🌐 IPv6</div>
+                  <div className="kv-t">IPv6</div>
                   <div className="kv-s">Off = IPv4 only (recommended). Turn on if your network has working IPv6.</div>
                 </div>
                 <label className="switch">
@@ -1420,7 +1564,7 @@ function App() {
               <div className="hr" />
               <div className="toggle-row">
                 <div>
-                  <div className="kv-t">✂️ TLS Fragment</div>
+                  <div className="kv-t">TLS Fragment</div>
                   <div className="kv-s">Use the link's fragment value. Turn on only if the server is blocked.</div>
                 </div>
                 <label className="switch">
@@ -1431,7 +1575,7 @@ function App() {
               <div className="hr" />
               <div className="toggle-row">
                 <div>
-                  <div className="kv-t">📡 UDP Relay</div>
+                  <div className="kv-t">UDP Relay</div>
                   <div className="kv-s">Off = TCP only (recommended). Turn on for QUIC/games.</div>
                 </div>
                 <label className="switch">
@@ -1570,9 +1714,9 @@ function App() {
                   <div className="hr" />
                   <div className="update-btn-row">
                     <button className="btn-primary m0" onClick={() => doXrayUpdate(xrayUpdate.url)}>
-                      ⬇ Update Now
+                      Update Now
                     </button>
-                    <button className="btn-secondary" onClick={checkXrayUpdate}>↻</button>
+                    <button className="btn-secondary" onClick={checkXrayUpdate} aria-label="Refresh"><Icon name="refresh" size={14} /></button>
                   </div>
                 </>
               ) : (
@@ -1583,24 +1727,30 @@ function App() {
                     </div>
                   )}
                   <button
-                    className="btn-primary m0"
-                    style={{ marginTop: xrayCheckMsg ? 0 : 12 }}
+                    className="btn-secondary btn-block"
+                    style={{ marginTop: xrayCheckMsg ? 0 : 8 }}
                     onClick={checkXrayUpdate}
                   >
-                    🔍 Check for Updates
+                    <Icon name="refresh" size={13} /> Check for updates
                   </button>
                 </>
               )}
             </div>
 
             <div className="sec">Community</div>
-            <button
-              className="btn-primary m0"
-              style={{ marginBottom: 12 }}
-              onClick={() => invoke("open_link", { url: "https://t.me/lionrayvpn" })}
-            >
-              💬 Join Telegram
-            </button>
+            <div className="card link-card">
+              <button
+                className="link-row"
+                onClick={() => invoke("open_link", { url: "https://t.me/lionrayvpn" })}
+              >
+                <span className="link-row-ico"><Icon name="link" size={16} /></span>
+                <span className="link-row-main">
+                  <b>Telegram channel</b>
+                  <small>News, updates and support</small>
+                </span>
+                <Icon name="chevron" size={14} />
+              </button>
+            </div>
 
             <div className="sec">Danger Zone</div>
             <button
@@ -1621,7 +1771,7 @@ function App() {
             </button>
 
             <div className="about-box">
-              🦁 Powered by Sett Min Paing
+              Powered by Sett Min Paing
             </div>
           </div>
         </>
@@ -1630,7 +1780,7 @@ function App() {
       {tab === "logs" && (
         <>
           <header className="topbar">
-            <button className="back-btn" onClick={() => setTab("home")}>‹</button>
+            <button className="back-btn" onClick={() => setTab("home")} aria-label="Back"><Icon name="arrow-left" size={17} /></button>
             <span className="topbar-title">Logs</span>
             <span style={{ width: 46 }} />
           </header>
@@ -1638,9 +1788,9 @@ function App() {
             <div className="log-toolbar">
               <div className="log-tabs">
                 {([
-                  ["app", "📱 App"],
-                  ["xray", "🚀 Xray"],
-                  ["singbox", "🛰️ TUN"],
+                  ["app", "App"],
+                  ["xray", "Xray"],
+                  ["singbox", "TUN"],
                 ] as const).map(([id, label]) => (
                   <button
                     key={id}
@@ -1652,17 +1802,17 @@ function App() {
                 ))}
               </div>
               <div className="log-actions">
-                <button className="log-ico-btn" onClick={() => void loadLogs()} disabled={logBusy} title="Refresh">↻</button>
-                <button className="log-ico-btn" onClick={() => void copyLogs()} title="Copy log">⧉</button>
-                <button className="log-ico-btn danger" onClick={clearLogs} title="Clear all logs">🗑</button>
+                <button className="log-ico-btn" onClick={() => void loadLogs()} disabled={logBusy} title="Refresh"><Icon name="refresh" size={14} /></button>
+                <button className="log-ico-btn" onClick={() => void copyLogs()} title="Copy log"><Icon name="copy" size={14} /></button>
+                <button className="log-ico-btn danger" onClick={clearLogs} title="Clear all logs"><Icon name="trash" size={14} /></button>
               </div>
             </div>
             <div className="log-filters">
               <div className="log-levels">
                 {([
                   ["all", "All"],
-                  ["warn", "⚠ Warn+"],
-                  ["error", "⛔ Error"],
+                  ["warn", "Warn"],
+                  ["error", "Error"],
                 ] as const).map(([id, label]) => (
                   <button
                     key={id}
@@ -1674,7 +1824,7 @@ function App() {
                 ))}
               </div>
               <div className="log-search">
-                <span>🔍</span>
+                <Icon name="search" size={13} />
                 <input
                   value={logQuery}
                   onChange={(e) => setLogQuery(e.target.value)}
@@ -1715,7 +1865,9 @@ function App() {
                 </>
               ) : (
                 <div className="log-empty">
-                  <span>{logLevel !== "all" || logQuery ? "🔍" : "📋"}</span>
+                  <span>
+                    <Icon name={logLevel !== "all" || logQuery ? "search" : "terminal"} size={24} />
+                  </span>
                   <p>{logLevel !== "all" || logQuery ? "မကိုက်ညီတဲ့ log မရှိပါ" : "Log မရှိသေးပါ"}</p>
                   <small>
                     {logLevel !== "all" || logQuery
@@ -1732,7 +1884,9 @@ function App() {
 
       {/* FAB */}
       {(tab === "servers" || tab === "subs") && (
-        <button className="fab" onClick={() => setSheet(sheet === "menu" ? null : "menu")}>+</button>
+        <button className="fab" onClick={() => setSheet(sheet === "menu" ? null : "menu")} aria-label="Add node">
+          <Icon name="plus" size={20} />
+        </button>
       )}
 
       {/* action sheet */}
@@ -1743,19 +1897,19 @@ function App() {
               <>
                 <div className="sheet-title">Add Node</div>
                 <button className="sheet-item" onClick={importFromClipboard}>
-                  <span className="sheet-ico">📋</span>
+                  <span className="sheet-ico"><Icon name="clipboard" size={17} /></span>
                   <div><b>Import from Clipboard</b><small>Paste copied links</small></div>
                 </button>
                 <button className="sheet-item" onClick={() => { setSheet(null); startCamera(); }}>
-                  <span className="sheet-ico">📷</span>
+                  <span className="sheet-ico"><Icon name="camera" size={17} /></span>
                   <div><b>Scan QR Code</b><small>Use camera</small></div>
                 </button>
                 <button className="sheet-item" onClick={() => { setSheet(null); fileRef.current?.click(); }}>
-                  <span className="sheet-ico">🖼️</span>
+                  <span className="sheet-ico"><Icon name="image" size={17} /></span>
                   <div><b>Import QR Photo</b><small>Decode saved image</small></div>
                 </button>
                 <button className="sheet-item" onClick={() => setSheet("sub")}>
-                  <span className="sheet-ico">🔗</span>
+                  <span className="sheet-ico"><Icon name="link" size={17} /></span>
                   <div><b>Add Subscription</b><small>Fetch nodes from URL</small></div>
                 </button>
               </>
@@ -1778,7 +1932,62 @@ function App() {
         </div>
       )}
 
-      {/* QR camera */}
+      {/* server actions */}
+      {menuServer && (
+        <div className="overlay" onClick={() => setMenuServer(null)}>
+          <div className="sheet" onClick={(e) => e.stopPropagation()}>
+            <div className="sheet-head">
+              <span
+                className="proto-chip"
+                style={{
+                  background: `${PROTO_COLORS[menuServer.protocol] || "#64748B"}14`,
+                  color: PROTO_COLORS[menuServer.protocol] || "#64748B",
+                  borderColor: `${PROTO_COLORS[menuServer.protocol] || "#64748B"}26`,
+                }}
+              >
+                {protoLabel(menuServer.protocol)}
+              </span>
+              <div className="sheet-head-copy">
+                <b>{menuServer.name}</b>
+                <small>{menuServer.address}:{menuServer.port}</small>
+              </div>
+              <span className="sheet-ping" style={{ color: pingColor(menuServer.ping) }}>
+                {menuServer.ping == null ? "—" : menuServer.ping < 0 ? "ERR" : `${menuServer.ping} ms`}
+              </span>
+            </div>
+            <button className="sheet-item" onClick={() => { void pingOne(menuServer.id); setMenuServer(null); }}>
+              <span className="sheet-ico"><Icon name="timer" size={17} /></span>
+              <div><b>Test latency</b><small>Ping this node</small></div>
+            </button>
+            <button className="sheet-item" onClick={() => { const s = menuServer; setMenuServer(null); startEdit(s); }}>
+              <span className="sheet-ico"><Icon name="edit" size={17} /></span>
+              <div><b>Edit config</b><small>Name, address, transport</small></div>
+            </button>
+            <button className="sheet-item" onClick={() => { const s = menuServer; setMenuServer(null); void startShare(s); }}>
+              <span className="sheet-ico"><Icon name="share" size={17} /></span>
+              <div><b>Share link</b><small>Copy link or show QR</small></div>
+            </button>
+            <button
+              className="sheet-item danger"
+              onClick={() => {
+                const s = menuServer;
+                setMenuServer(null);
+                setConfirmDlg({
+                  msg: `Delete "${s.name}"?\nThis cannot be undone.`,
+                  onOk: () => {
+                    removeServer(s.id);
+                    showToast("Node removed");
+                  },
+                });
+              }}
+            >
+              <span className="sheet-ico"><Icon name="trash" size={17} /></span>
+              <div><b>Delete node</b><small>Remove it from this device</small></div>
+            </button>
+            <button className="sheet-cancel" onClick={() => setMenuServer(null)}>Cancel</button>
+          </div>
+        </div>
+      )}
       {qrOpen && (
         <div className="overlay center-overlay" onClick={() => { stopCamera(); setQrOpen(false); }}>
           <div className="qr-modal" onClick={(e) => e.stopPropagation()}>
@@ -1793,7 +2002,7 @@ function App() {
       {editing && (
         <div className="modal-overlay" onClick={() => setEditing(null)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-title">✎ Edit Config</div>
+            <div className="modal-title">Edit config</div>
             <div className="modal-body">
               <div className="f-label">Name</div>
               <input className="input" value={ef.name ?? ""} onChange={(e) => setEf({ ...ef, name: e.target.value })} />
@@ -1910,17 +2119,17 @@ function App() {
       {sharing && (
         <div className="modal-overlay" onClick={() => setSharing(null)}>
           <div className="modal center" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-title">📤 Share "{sharing.srv.name}"</div>
+            <div className="modal-title">Share "{sharing.srv.name}"</div>
             <div className="modal-body">
               <div className="uri-box">{sharing.uri}</div>
               {qrUrl && <img src={qrUrl} alt="QR" className="qr-img" />}
             </div>
             <div className="modal-actions">
               <button className="btn-secondary" onClick={() => invoke("copy_clipboard", { text: sharing.uri }).then(() => showToast("Copied ✓"))}>
-                📋 Copy
+                Copy
               </button>
               <button className="btn-secondary" onClick={() => (qrUrl ? setQrUrl("") : showQr())}>
-                {qrUrl ? "Hide QR" : "📷 QR"}
+                {qrUrl ? "Hide QR" : "Show QR"}
               </button>
               <button className="btn-primary m0" onClick={() => setSharing(null)}>Done</button>
             </div>
@@ -1959,14 +2168,14 @@ function App() {
       {/* bottom nav */}
       <nav className="nav">
         {([
-          ["home", "⏻", "Home"],
-          ["servers", "📡", "Nodes"],
-          ["subs", "🔗", "Subs"],
-          ["logs", "📋", "Logs"],
-          ["settings", "⚙", "Settings"],
+          ["home", "home", "Home"],
+          ["servers", "server", "Nodes"],
+          ["subs", "layers", "Subs"],
+          ["logs", "terminal", "Logs"],
+          ["settings", "sliders", "Settings"],
         ] as const).map(([id, icon, label]) => (
           <button key={id} className={`nav-btn ${tab === id ? "active" : ""}`} onClick={() => setTab(id)}>
-            <span className="nav-ico">{icon}</span>
+            <span className="nav-ico"><Icon name={icon} size={19} /></span>
             {id === "settings" && xrayUpdate && <span className="nav-dot" />}
             <span>{label}</span>
           </button>
