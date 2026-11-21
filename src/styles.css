@@ -172,19 +172,19 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   gap: 5px;
   height: 30px;
   padding: 0 10px;
-  border: 1px solid var(--red);
+  border: 1px solid var(--primary);
   border-radius: 9px;
-  background: var(--red-glass);
+  background: var(--primary-soft);
   backdrop-filter: blur(8px) saturate(1.12);
   -webkit-backdrop-filter: blur(8px) saturate(1.12);
-  color: var(--red);
+  color: var(--primary);
   font-size: 11px;
   font-weight: 600;
   cursor: pointer;
   transition: border-color .15s, color .15s, background .15s;
 }
-.route-chip:hover { border-color: var(--red); color: var(--red); background: var(--red-glass); }
-.route-chip svg:last-child { color: var(--red); opacity: .7; }
+.route-chip:hover { border-color: var(--primary); color: var(--primary); background: var(--primary-soft); }
+.route-chip svg:last-child { color: var(--primary); opacity: .7; }
 
 .topbar-title {
   flex-shrink: 0;
