@@ -1246,6 +1246,10 @@ function App() {
 
           <div className="home-body">
             <section className={`status-stage ${connected ? "on" : ""}`}>
+              <div className={`status-badge ${connected ? "on" : ""}`}>
+                <span className="status-dot" />
+                {connected ? "Protected" : "Unprotected"}
+              </div>
               <div className="power-wrap">
                 <button
                   className={`power ${connected ? "on" : ""}`}

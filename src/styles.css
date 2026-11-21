@@ -238,6 +238,27 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .sel-btn:hover:not(:disabled) { border-color: var(--line-strong); background: var(--surface-2); }
 .test-btn:disabled, .sel-btn:disabled { opacity: .4; cursor: default; }
 
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 14px;
+  padding: 5px 10px;
+  border: 1px solid var(--line);
+  border-radius: 99px;
+  background: var(--surface);
+  color: var(--sub);
+  font-size: 10.5px;
+  font-weight: 650;
+  letter-spacing: .3px;
+}
+.status-badge.on {
+  border-color: var(--green-line);
+  background: var(--green-soft);
+  color: var(--green);
+}
+.status-badge .status-dot { width: 6px; height: 6px; }
+
 /* ── home ── */
 .home-body {
   flex: 1;
@@ -267,8 +288,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   border: 1px solid var(--line);
   border-radius: 50%;
   background: var(--surface);
-  box-shadow: var(--shadow-sm);
-  transition: background .22s, border-color .22s;
+  box-shadow: 0 0 40px rgba(47, 107, 255, .14), var(--shadow-sm);
+  transition: background .22s, border-color .22s, box-shadow .22s;
   overflow: visible;
 }
 .power-wrap::before,
@@ -281,7 +302,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 }
 .power-wrap::before { inset: 12px; border: 1px solid var(--line); opacity: .75; }
 .power-wrap::after { inset: -10px; border: 1px solid transparent; }
-.status-stage.on .power-wrap { background: var(--green-soft); border-color: var(--green-line); }
+.status-stage.on .power-wrap { background: var(--green-soft); border-color: var(--green-line); box-shadow: 0 0 48px rgba(14, 159, 110, .24), var(--shadow-sm); }
 .status-stage.on .power-wrap::before {
   border-color: var(--green-line);
   animation: ringPulse 2s ease-out infinite;
@@ -304,17 +325,15 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   border-radius: 50%;
   display: grid;
   place-items: center;
-  background: var(--primary);
+  background: linear-gradient(145deg, var(--primary), #4F46E5);
   color: var(--on-primary);
-  cursor: pointer;
-  box-shadow: 0 10px 24px rgba(47, 107, 255, .24), inset 0 1px 0 rgba(255, 255, 255, .18);
   transition: transform .16s, background .2s, box-shadow .2s;
 }
 .power:hover:not(:disabled) { transform: scale(1.025); }
 .power:active:not(:disabled) { transform: scale(.98); }
 .power:disabled { opacity: .7; cursor: default; }
 .power.on {
-  background: var(--green);
+  background: linear-gradient(145deg, var(--green), #059669);
   color: var(--on-green);
   box-shadow: 0 10px 24px rgba(14, 159, 110, .24), inset 0 1px 0 rgba(255, 255, 255, .18);
 }
