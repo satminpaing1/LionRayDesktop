@@ -1,10 +1,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.31";
+pub const APP_VERSION: &str = "1.8.45";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -24,6 +24,9 @@ static NET_REPAIRING: AtomicBool = AtomicBool::new(false);
 static AUTO: AtomicBool = AtomicBool::new(false);
 // last successful connection, replayed by the watchdog when the tunnel dies
 static LAST: Mutex<Option<LastConnect>> = Mutex::new(None);
+// consecutive tunnel probe failures (keep-warm); triggers auto-reconnect at 3
+static TUNNEL_FAILS: AtomicU32 = AtomicU32::new(0);
+static RECONNECTING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone)]
 struct LastConnect {
@@ -169,7 +172,7 @@ fn start_tunnel_keepalive() {
         // Let startup cleanup / an auto-connect settle before the first tick.
         std::thread::sleep(std::time::Duration::from_secs(12));
         loop {
-            std::thread::sleep(std::time::Duration::from_secs(20));
+            std::thread::sleep(std::time::Duration::from_secs(15));
             if !CONNECTED.load(Ordering::SeqCst) || CONNECTING.load(Ordering::SeqCst) {
                 continue;
             }
@@ -197,8 +200,35 @@ fn start_tunnel_keepalive() {
                 }
             }
             // TUN mode owns the default route, so a plain request enters it.
+            // Probe the tunnel. A dead idle connection (CDN drop) often leaves
+            // the core alive but returns errors here, so treat repeated
+            // failures as "disconnected" and auto-recover instead of silently
+            // showing "connected" with no working internet.
+            let mut probe_ok = false;
             if let Ok(client) = builder.build() {
-                let _ = client.get("http://www.gstatic.com/generate_204").send();
+                if let Ok(resp) = client.get("http://www.gstatic.com/generate_204").send() {
+                    probe_ok = resp.status().is_success() || resp.status().as_u16() == 204;
+                }
+            }
+            if probe_ok {
+                TUNNEL_FAILS.store(0, Ordering::SeqCst);
+            } else {
+                let fails = TUNNEL_FAILS.fetch_add(1, Ordering::SeqCst) + 1;
+                app_log(&format!("keep-warm: tunnel probe failed ({fails})"));
+                if fails >= 2 && !RECONNECTING.load(Ordering::SeqCst) {
+                    TUNNEL_FAILS.store(0, Ordering::SeqCst);
+                    CONNECTED.store(false, Ordering::SeqCst);
+                    spawn_network_repair("idle tunnel (keep-warm)");
+                    std::thread::spawn(|| {
+                        for _ in 0..200 {
+                            if !NET_REPAIRING.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                        reconnect_last();
+                    });
+                }
             }
         }
     });
@@ -2786,6 +2816,79 @@ async fn connect(
     } else {
         "Connected via System Proxy".into()
     })
+}
+
+// Auto-recover a stalled tunnel using the last successful connection params.
+// Only runs when the user intended to stay connected (AUTO == true); a manual
+// disconnect sets AUTO=false so this never resurrects a closed session.
+fn reconnect_last() {
+    if !AUTO.load(Ordering::SeqCst) {
+        return;
+    }
+    let last = match LAST.lock() {
+        Ok(g) => g.clone(),
+        Err(_) => None,
+    };
+    let Some(lc) = last else {
+        app_log("auto-reconnect: no saved connection");
+        return;
+    };
+    if RECONNECTING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    CONNECTING.store(true, Ordering::SeqCst);
+    std::thread::spawn(move || {
+        for _ in 0..200 {
+            if !NET_REPAIRING.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        cleanup();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let mut last_err = String::new();
+        let mut success = false;
+        let mut tun_eff = false;
+        for attempt in 1..=3 {
+            app_log(&format!("auto-reconnect attempt {attempt}"));
+            match establish(
+                &lc.server,
+                &lc.routing,
+                &lc.dns,
+                lc.ad_block,
+                &lc.bypass,
+                lc.tun,
+                lc.udp,
+                lc.ipv6,
+                lc.fragment,
+            ) {
+                Ok(t) => {
+                    tun_eff = t;
+                    success = true;
+                    break;
+                }
+                Err(e) => {
+                    last_err = e;
+                    app_log(&format!("auto-reconnect attempt {attempt} failed: {last_err}"));
+                    cleanup();
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                }
+            }
+        }
+        CONNECTING.store(false, Ordering::SeqCst);
+        if success {
+            AUTO.store(true, Ordering::SeqCst);
+            CONNECTED.store(true, Ordering::SeqCst);
+            app_log(&format!(
+                "auto-reconnect ok: {}:{} (tun={})",
+                lc.server.address, lc.server.port, tun_eff
+            ));
+        } else {
+            app_log(&format!("auto-reconnect failed: {last_err}"));
+            CONNECTED.store(false, Ordering::SeqCst);
+        }
+        RECONNECTING.store(false, Ordering::SeqCst);
+    });
 }
 
 #[tauri::command]
