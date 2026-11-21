@@ -172,17 +172,19 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   gap: 5px;
   height: 30px;
   padding: 0 10px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--red);
   border-radius: 9px;
-  background: var(--surface);
-  color: var(--sub);
+  background: var(--red-glass);
+  backdrop-filter: blur(8px) saturate(1.12);
+  -webkit-backdrop-filter: blur(8px) saturate(1.12);
+  color: var(--red);
   font-size: 11px;
   font-weight: 600;
   cursor: pointer;
   transition: border-color .15s, color .15s, background .15s;
 }
-.route-chip:hover { border-color: var(--line-strong); color: var(--text); background: var(--surface-2); }
-.route-chip svg:last-child { color: var(--muted); }
+.route-chip:hover { border-color: var(--red); color: var(--red); background: var(--red-glass); }
+.route-chip svg:last-child { color: var(--red); opacity: .7; }
 
 .topbar-title {
   flex-shrink: 0;
@@ -362,18 +364,13 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .home-panel {
   flex-shrink: 0;
   overflow: hidden;
-  border: 1px solid var(--red);
+  border: 1px solid var(--line);
   border-radius: 20px;
-  background: var(--red-glass);
-  backdrop-filter: blur(10px) saturate(1.12);
-  -webkit-backdrop-filter: blur(10px) saturate(1.12);
+  background: var(--surface);
   box-shadow: var(--shadow-sm);
-  transition: border-color .22s, box-shadow .22s;
+  transition: border-color .22s;
 }
-.home-panel.on {
-  border-color: var(--green);
-  box-shadow: 0 0 0 3px var(--green-soft), var(--shadow-sm);
-}
+.home-panel.on { border-color: var(--green); box-shadow: 0 0 0 3px var(--green-soft), var(--shadow-sm); }
 .server-row {
   width: 100%;
   display: flex;
