@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.45";
+pub const APP_VERSION: &str = "1.8.46";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -161,24 +161,49 @@ fn set_keep_awake(on: bool) {
 #[cfg(not(windows))]
 fn set_keep_awake(_on: bool) {}
 
-// Keep the tunnel warm independently of the WebView. When the window is
-// minimized the frontend timers are throttled by Chromium, and a CDN can treat
-// a few quiet minutes as a dead WebSocket. The next click then pays for a full
-// TCP+TLS+WS handshake and feels slow. This loop only sends a tiny request
-// through the ACTIVE data path — it never kills, restarts or reconnects
-// anything, so the calm "no watchdog" behaviour stays intact.
+// One real request through the active data path. Used both by the keep-warm
+// loop and to verify a refresh actually restored the tunnel.
+fn tunnel_probe() -> bool {
+    let tun_on = TUN_CHILD.lock().map(|g| g.is_some()).unwrap_or(false);
+    let mut builder = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5));
+    if !tun_on {
+        // Proxy mode: Xray's SOCKS port is the real data path.
+        match reqwest::Proxy::all(format!("socks5h://127.0.0.1:{SOCKS_PORT}")) {
+            Ok(p) => builder = builder.proxy(p),
+            Err(_) => return false,
+        }
+    }
+    // TUN mode owns the default route, so a plain request enters it.
+    if let Ok(client) = builder.build() {
+        if let Ok(resp) = client.get("http://www.gstatic.com/generate_204").send() {
+            return resp.status().is_success() || resp.status().as_u16() == 204;
+        }
+    }
+    false
+}
+
+// Keep the tunnel warm independently of the WebView. Minimized windows get
+// their timers throttled by Chromium, so this native loop is the one that both
+// keeps the path alive and notices a stall immediately. A single failure is
+// never enough to yank the connection: we first refresh only the Xray core
+// (system proxy/TUN stay put, so the UI does not flip), and only escalate to
+// a full reconnect if the refresh does not restore the path.
 fn start_tunnel_keepalive() {
     std::thread::spawn(|| {
         // Let startup cleanup / an auto-connect settle before the first tick.
-        std::thread::sleep(std::time::Duration::from_secs(12));
+        std::thread::sleep(std::time::Duration::from_secs(8));
         loop {
-            std::thread::sleep(std::time::Duration::from_secs(15));
+            // 6 s cadence: a stalled tunnel is noticed in ~12 s and repaired
+            // before the user reaches for the browser. The probe is a tiny
+            // generate_204 request, so this costs almost nothing.
+            std::thread::sleep(std::time::Duration::from_secs(6));
             if !CONNECTED.load(Ordering::SeqCst) || CONNECTING.load(Ordering::SeqCst) {
                 continue;
             }
-            // Also watch core/TUN health here: when the window is minimized the
-            // webview heartbeat is throttled, so this native loop is the one
-            // that still notices a drop and repairs the machine in time.
+            // Watch core/TUN health here too: when the window is minimized the
+            // webview heartbeat is throttled, so this native loop still
+            // notices a process death and repairs the machine in time.
             if !core_is_alive() {
                 CONNECTED.store(false, Ordering::SeqCst);
                 spawn_network_repair("core exit (keep-warm)");
@@ -189,47 +214,41 @@ fn start_tunnel_keepalive() {
                 spawn_network_repair("TUN exit (keep-warm)");
                 continue;
             }
-            let tun_on = TUN_CHILD.lock().map(|g| g.is_some()).unwrap_or(false);
-            let mut builder = reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(6));
-            if !tun_on {
-                // Proxy mode: Xray's SOCKS port is the real data path.
-                match reqwest::Proxy::all(format!("socks5h://127.0.0.1:{SOCKS_PORT}")) {
-                    Ok(p) => builder = builder.proxy(p),
-                    Err(_) => continue,
-                }
-            }
-            // TUN mode owns the default route, so a plain request enters it.
-            // Probe the tunnel. A dead idle connection (CDN drop) often leaves
-            // the core alive but returns errors here, so treat repeated
-            // failures as "disconnected" and auto-recover instead of silently
-            // showing "connected" with no working internet.
-            let mut probe_ok = false;
-            if let Ok(client) = builder.build() {
-                if let Ok(resp) = client.get("http://www.gstatic.com/generate_204").send() {
-                    probe_ok = resp.status().is_success() || resp.status().as_u16() == 204;
-                }
-            }
-            if probe_ok {
+            if tunnel_probe() {
                 TUNNEL_FAILS.store(0, Ordering::SeqCst);
-            } else {
-                let fails = TUNNEL_FAILS.fetch_add(1, Ordering::SeqCst) + 1;
-                app_log(&format!("keep-warm: tunnel probe failed ({fails})"));
-                if fails >= 2 && !RECONNECTING.load(Ordering::SeqCst) {
-                    TUNNEL_FAILS.store(0, Ordering::SeqCst);
-                    CONNECTED.store(false, Ordering::SeqCst);
-                    spawn_network_repair("idle tunnel (keep-warm)");
-                    std::thread::spawn(|| {
-                        for _ in 0..200 {
-                            if !NET_REPAIRING.load(Ordering::SeqCst) {
-                                break;
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(50));
-                        }
-                        reconnect_last();
-                    });
+                continue;
+            }
+
+            let fails = TUNNEL_FAILS.fetch_add(1, Ordering::SeqCst) + 1;
+            app_log(&format!("keep-warm: tunnel probe failed ({fails})"));
+            if fails < 2 || RECONNECTING.load(Ordering::SeqCst) {
+                continue;
+            }
+            TUNNEL_FAILS.store(0, Ordering::SeqCst);
+
+            // Step 1: transparent core refresh. The local proxy port keeps
+            // answering the whole time, so apps and the UI see no flip.
+            if soft_restart_core() {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                if tunnel_probe() {
+                    app_log("keep-warm: core refresh restored the tunnel");
+                    continue;
                 }
             }
+
+            // Step 2: the stall survived a fresh core - repair the whole
+            // network state and replay the last successful connection.
+            CONNECTED.store(false, Ordering::SeqCst);
+            spawn_network_repair("idle tunnel (keep-warm)");
+            std::thread::spawn(|| {
+                for _ in 0..200 {
+                    if !NET_REPAIRING.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                reconnect_last();
+            });
         }
     });
 }
@@ -1194,25 +1213,25 @@ fn generate_config(
         "outboundTag": "api"
     }));
 
-    // Build the DNS section. "system" must truly use the OS resolver: emitting
-    // a plaintext 8.8.8.8 resolver here used to make every outbound lookup
-    // depend on a reachable public DNS, which stalls badly on networks that
-    // block UDP/53.
-    let explicit_dns = match dns {
-        "system" | "" => None,
-        "google" => Some(json!({ "servers": ["8.8.8.8", "8.8.4.4"] })),
-        "cloudflare" => Some(json!({ "servers": ["1.1.1.1", "1.0.0.1"] })),
-        "quad9" => Some(json!({ "servers": ["9.9.9.9", "149.112.112.112"] })),
-        "adguard" => Some(json!({ "servers": ["94.140.14.14", "94.140.15.15"] })),
-        "custom" => Some(json!({ "servers": ["8.8.8.8"] })),
-        _ => None,
-    }
-    .map(|mut section| {
-        section["queryStrategy"] = json!(if ipv6 { "UseIP" } else { "UseIPv4" });
-        section
+    // Build the DNS section. "system" truly uses the OS resolver via the
+    // special "localhost" server - never a hardcoded public resolver, which
+    // stalls on networks that block UDP/53. We still emit the section so the
+    // query strategy can force IPv4 when IPv6 is off (the server hostname is
+    // now resolved by Xray on every dial).
+    let dns_is_explicit = !matches!(dns, "system" | "");
+    let mut explicit_dns = Some(match dns {
+        "google" => json!({ "servers": ["8.8.8.8", "8.8.4.4"] }),
+        "cloudflare" => json!({ "servers": ["1.1.1.1", "1.0.0.1"] }),
+        "quad9" => json!({ "servers": ["9.9.9.9", "149.112.112.112"] }),
+        "adguard" => json!({ "servers": ["94.140.14.14", "94.140.15.15"] }),
+        "custom" => json!({ "servers": ["8.8.8.8"] }),
+        _ => json!({ "servers": ["localhost"] }),
     });
+    if let Some(section) = explicit_dns.as_mut() {
+        section["queryStrategy"] = json!(if ipv6 { "UseIP" } else { "UseIPv4" });
+    }
 
-    let routing_domain_strategy = if explicit_dns.is_some() { "IPIfNonMatch" } else { "AsIs" };
+    let routing_domain_strategy = if dns_is_explicit { "IPIfNonMatch" } else { "AsIs" };
 
     // TLS ClientHello fragmentation requested by the share link: the proxy
     // outbound dials through a freedom outbound that fragments the handshake.
@@ -2550,14 +2569,16 @@ fn establish(
         }
     }
 
-    // Preserve the hostname for TLS/SNI and the WS Host header even though the
-    // socket itself will dial a pre-resolved address.
+    // Dial the HOSTNAME, never a pre-resolved IP. Cloudflare edge IPs rotate;
+    // pinning one IP at connect time left Xray dialing a dead colo after idle
+    // (xray.log: "transport/internet/websocket: failed to dial ... > EOF")
+    // while the core stayed alive and the UI still said "connected". Xray now
+    // re-resolves on every dial, so a fresh connection always finds a live
+    // edge and a stale IP can never strand the tunnel. SNI and the WS Host
+    // header already use the hostname, so TLS stays correct.
     let mut dial_server = server.clone();
     if dial_server.sni.is_empty() {
         dial_server.sni = dial_server.address.clone();
-    }
-    if let Some(ip) = resolve_server_address(server) {
-        dial_server.address = ip;
     }
 
     let config = generate_config(&dial_server, routing, dns, ad_block, bypass, udp, ipv6, fragment_on)?;
@@ -2816,6 +2837,37 @@ async fn connect(
     } else {
         "Connected via System Proxy".into()
     })
+}
+
+// Refresh only the Xray core when the tunnel is stalled but the local proxy
+// path is still intact. System proxy / TUN / routes are left untouched, so
+// browsers keep talking to 127.0.0.1:10808 and the UI never shows a drop.
+fn soft_restart_core() -> bool {
+    if RECONNECTING.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    let result = (|| {
+        let Some(lc) = LAST.lock().ok().and_then(|g| g.clone()) else {
+            return false;
+        };
+        // A fresh config forces a new WebSocket session; the hostname dial
+        // also lets Xray pick a current Cloudflare edge on the next request.
+        match establish(
+            &lc.server, &lc.routing, &lc.dns, lc.ad_block, &lc.bypass,
+            lc.tun, lc.udp, lc.ipv6, lc.fragment,
+        ) {
+            Ok(_) => {
+                app_log("core refreshed (system proxy untouched)");
+                true
+            }
+            Err(e) => {
+                app_log(&format!("core refresh failed: {e}"));
+                false
+            }
+        }
+    })();
+    RECONNECTING.store(false, Ordering::SeqCst);
+    result
 }
 
 // Auto-recover a stalled tunnel using the last successful connection params.
@@ -3958,13 +4010,39 @@ mod tests {
     }
 
     #[test]
+    fn outbound_keeps_hostname_so_xray_can_refresh_dns() {
+        let cfg: Value = serde_json::from_str(
+            &generate_config(&user_server(), "global", "system", false, &[], false, false, false)
+                .unwrap(),
+        )
+        .unwrap();
+        // A pinned Cloudflare IP goes stale after idle; the hostname lets Xray
+        // resolve a fresh edge on every dial while TLS/SNI stay correct.
+        assert_eq!(
+            cfg["outbounds"][0]["settings"]["vnext"][0]["address"],
+            "smp.settminpaing.mm.am"
+        );
+        assert_eq!(
+            cfg["outbounds"][0]["streamSettings"]["tlsSettings"]["serverName"],
+            "smp.settminpaing.mm.am"
+        );
+        assert_eq!(
+            cfg["outbounds"][0]["streamSettings"]["wsSettings"]["headers"]["Host"],
+            "smp.settminpaing.mm.am"
+        );
+    }
+
+    #[test]
     fn system_dns_uses_os_resolver_and_defaults_are_tcp_ipv4() {
         let cfg: Value = serde_json::from_str(
             &generate_config(&user_server(), "global", "system", false, &[], false, false, false)
                 .unwrap(),
         )
         .unwrap();
-        assert!(cfg.get("dns").is_none());
+        // System DNS still uses the OS resolver, but the section is emitted
+        // so IPv4 can be forced on the server dial.
+        assert_eq!(cfg["dns"]["servers"][0], "localhost");
+        assert_eq!(cfg["dns"]["queryStrategy"], "UseIPv4");
         assert_eq!(cfg["routing"]["domainStrategy"], "AsIs");
         // UDP off by default
         assert_eq!(cfg["inbounds"][0]["settings"]["udp"], false);
