@@ -255,18 +255,31 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   background: var(--surface);
   box-shadow: var(--shadow-sm);
   transition: background .22s, border-color .22s;
+  overflow: visible;
 }
-.power-wrap::before {
+.power-wrap::before,
+.power-wrap::after {
   content: "";
   position: absolute;
-  inset: 12px;
-  border: 1px solid var(--line);
   border-radius: 50%;
-  opacity: .75;
   pointer-events: none;
+  transform-origin: center;
 }
+.power-wrap::before { inset: 12px; border: 1px solid var(--line); opacity: .75; }
+.power-wrap::after { inset: -10px; border: 1px solid transparent; }
 .status-stage.on .power-wrap { background: var(--green-soft); border-color: var(--green-line); }
-.status-stage.on .power-wrap::before { border-color: var(--green-line); }
+.status-stage.on .power-wrap::before {
+  border-color: var(--green-line);
+  animation: ringPulse 2s ease-out infinite;
+}
+.status-stage.on .power-wrap::after {
+  border-color: var(--green-line);
+  animation: ringPulse 2.4s ease-out infinite .7s;
+}
+@keyframes ringPulse {
+  0% { transform: scale(.9); opacity: .7; }
+  100% { transform: scale(1.32); opacity: 0; }
+}
 
 .power {
   position: relative;

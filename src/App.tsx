@@ -1234,7 +1234,7 @@ function App() {
         <>
           <header className="topbar home-top">
             <div className="brand">
-              <div className="brand-mark"><Icon name="shield" size={18} /></div>
+              <div className="brand-mark">🦁</div>
               <div className="brand-text">
                 <span className="logo">LionRay</span>
                 <small>VPN</small>
