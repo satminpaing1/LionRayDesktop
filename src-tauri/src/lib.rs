@@ -3610,6 +3610,71 @@ async fn save_store(app: tauri::AppHandle, key: String, value: String) -> Result
     .map_err(|e| format!("store write task failed: {e}"))?
 }
 
+#[tauri::command]
+async fn set_window_theme(window: tauri::Window, dark: bool) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        #[link(name = "dwmapi")]
+        extern "system" {
+            fn DwmSetWindowAttribute(
+                hwnd: *mut std::ffi::c_void,
+                dw_attribute: u32,
+                pv_attribute: *const std::ffi::c_void,
+                cb_attribute: u32,
+            ) -> i32;
+        }
+        #[link(name = "user32")]
+        extern "system" {
+            fn SetWindowPos(
+                hwnd: *mut std::ffi::c_void,
+                hwnd_insert_after: *mut std::ffi::c_void,
+                x: i32,
+                y: i32,
+                cx: i32,
+                cy: i32,
+                u_flags: u32,
+            ) -> i32;
+        }
+        const DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1: u32 = 19;
+        const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
+        const SWP_NOMOVE: u32 = 0x0002;
+        const SWP_NOSIZE: u32 = 0x0001;
+        const SWP_NOZORDER: u32 = 0x0004;
+        const SWP_FRAMECHANGED: u32 = 0x0020;
+        let hwnd = window.hwnd().map_err(|e| e.to_string())?;
+        let value: i32 = if dark { 1 } else { 0 };
+        unsafe {
+            let _ = DwmSetWindowAttribute(
+                hwnd.0,
+                DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1,
+                &value as *const i32 as *const std::ffi::c_void,
+                std::mem::size_of::<i32>() as u32,
+            );
+            let _ = DwmSetWindowAttribute(
+                hwnd.0,
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                &value as *const i32 as *const std::ffi::c_void,
+                std::mem::size_of::<i32>() as u32,
+            );
+            let _ = SetWindowPos(
+                hwnd.0,
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+            );
+        }
+        let _ = window.set_theme(if dark {
+            Some(tauri::Theme::Dark)
+        } else {
+            Some(tauri::Theme::Light)
+        });
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -3643,6 +3708,7 @@ pub fn run() {
             relaunch_as_admin,
             read_logs,
             clear_logs,
+            set_window_theme,
         ])
         .setup(|app| {
             // Heal stale state from a previous crash on a background thread:

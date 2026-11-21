@@ -485,11 +485,7 @@ function App() {
   }, [settings]);
   useEffect(() => {
     document.documentElement.classList.toggle("dark", settings.dark);
-    try {
-      getCurrentWindow().setTheme(settings.dark ? "dark" : "light").catch(() => {});
-    } catch {
-      /* ignore on platforms without runtime theme support */
-    }
+    void invoke("set_window_theme", { dark: settings.dark }).catch(() => {});
   }, [settings.dark]);
 
   // notify the user when a newer desktop release is published. Delayed so the

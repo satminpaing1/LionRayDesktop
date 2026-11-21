@@ -1,6 +1,6 @@
 [package]
 name = "lionray-desktop"
-version = "1.8.35"
+version = "1.8.36"
 description = "LionRay VPN - Desktop"
 authors = ["Sett Min Paing"]
 license = "MIT"

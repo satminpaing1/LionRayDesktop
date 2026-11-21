@@ -12,6 +12,7 @@
   --primary: #2F6BFF;
   --primary-soft: #EDF3FF;
   --on-primary: #FFFFFF;
+  --glass: rgba(255, 255, 255, .78);
   --green: #0E9F6E;
   --green-soft: #E8F7F1;
   --green-line: rgba(14, 159, 110, .22);
@@ -37,6 +38,7 @@
   --primary: #6C9BFF;
   --primary-soft: #182640;
   --on-primary: #0B0F16;
+  --glass: rgba(19, 24, 33, .78);
   --green: #32D583;
   --green-soft: #102A21;
   --green-line: rgba(50, 213, 131, .22);
@@ -123,6 +125,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   flex-shrink: 0;
   background: linear-gradient(180deg, var(--primary-soft), var(--surface));
   border-bottom: 1px solid var(--line);
+  backdrop-filter: blur(10px) saturate(1.15);
+  -webkit-backdrop-filter: blur(10px) saturate(1.15);
 }
 .home-top { padding-bottom: 2px; }
 .brand { display: flex; align-items: center; gap: 9px; min-width: 0; }
@@ -254,7 +258,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   place-items: center;
   border: 1px solid var(--line);
   border-radius: 50%;
-  background: var(--surface);
+  background: var(--glass);
+  backdrop-filter: blur(8px) saturate(1.1);
+  -webkit-backdrop-filter: blur(8px) saturate(1.1);
   box-shadow: var(--shadow-sm);
   transition: background .22s, border-color .22s;
   overflow: visible;
@@ -354,7 +360,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   overflow: hidden;
   border: 1px solid var(--line);
   border-radius: 20px;
-  background: var(--surface);
+  background: var(--glass);
+  backdrop-filter: blur(12px) saturate(1.15);
+  -webkit-backdrop-filter: blur(12px) saturate(1.15);
   box-shadow: var(--shadow-sm);
 }
 .server-row {
@@ -469,7 +477,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   padding: 38px 22px;
   border: 1px solid var(--line);
   border-radius: 20px;
-  background: var(--surface);
+  background: var(--glass);
+  backdrop-filter: blur(10px) saturate(1.12);
+  -webkit-backdrop-filter: blur(10px) saturate(1.12);
   color: var(--sub);
   font-size: 13px;
   text-align: center;
@@ -530,7 +540,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   overflow: hidden;
   border: 1px solid var(--line);
   border-radius: 16px;
-  background: var(--surface);
+  background: var(--glass);
+  backdrop-filter: blur(10px) saturate(1.12);
+  -webkit-backdrop-filter: blur(10px) saturate(1.12);
 }
 .group-empty { padding: 18px; color: var(--sub); font-size: 11.5px; text-align: center; }
 
@@ -624,7 +636,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   overflow: hidden;
   border: 1px solid var(--line);
   border-radius: 16px;
-  background: var(--surface);
+  background: var(--glass);
+  backdrop-filter: blur(10px) saturate(1.12);
+  -webkit-backdrop-filter: blur(10px) saturate(1.12);
 }
 .sub-card {
   display: flex;
@@ -693,7 +707,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   padding: 0 14px;
   border: 1px solid var(--line);
   border-radius: 16px;
-  background: var(--surface);
+  background: var(--glass);
+  backdrop-filter: blur(10px) saturate(1.12);
+  -webkit-backdrop-filter: blur(10px) saturate(1.12);
 }
 .kv {
   display: flex;
@@ -982,7 +998,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   border: 1px solid var(--line);
   border-bottom: 0;
   border-radius: 22px 22px 0 0;
-  background: var(--surface);
+  background: var(--glass);
+  backdrop-filter: blur(14px) saturate(1.15);
+  -webkit-backdrop-filter: blur(14px) saturate(1.15);
   box-shadow: 0 -12px 40px rgba(0, 0, 0, .18);
   animation: slideUp .22s cubic-bezier(.2, .8, .2, 1);
 }
@@ -1089,7 +1107,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   padding: 18px;
   border: 1px solid var(--line);
   border-radius: 18px;
-  background: var(--surface);
+  background: var(--glass);
+  backdrop-filter: blur(14px) saturate(1.15);
+  -webkit-backdrop-filter: blur(14px) saturate(1.15);
   box-shadow: 0 24px 60px rgba(0, 0, 0, .28);
   animation: slideUp .2s ease;
 }
@@ -1144,7 +1164,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   padding: 12px;
   border: 1px solid var(--line);
   border-radius: 18px;
-  background: var(--surface);
+  background: var(--glass);
+  backdrop-filter: blur(14px) saturate(1.15);
+  -webkit-backdrop-filter: blur(14px) saturate(1.15);
   box-shadow: 0 24px 60px rgba(0, 0, 0, .28);
 }
 .qr-video { width: 260px; height: 260px; object-fit: cover; border-radius: 12px; background: #000; }
