@@ -4,12 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.47";
-// The only Xray build validated against VLESS/WS + TLS on Cloudflare. Newer
-// builds (26.11.x) fail the WebSocket upgrade against our users' servers with
-// "transport/internet/websocket: failed to dial ... > EOF". The in-app updater
-// must never install a different version, and startup heals back to this one.
-const VALIDATED_XRAY_VERSION: &str = "26.3.27";
+pub const APP_VERSION: &str = "1.8.48";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -1010,7 +1005,12 @@ fn build_stream(server: &Server) -> Value {
                 "heartbeatPeriod": 20
             });
             if !server.ws_host.is_empty() {
+                // 26.11.x moved the WS Host to a dedicated field and warns that
+                // headers.Host is deprecated. Emit both: older cores use the
+                // header, newer ones use `host`, so either version can dial a
+                // Cloudflare-fronted server without an EOF on the upgrade.
                 ws["headers"] = json!({ "Host": server.ws_host });
+                ws["host"] = json!(server.ws_host);
             }
             stream["wsSettings"] = ws;
         }
@@ -2270,25 +2270,6 @@ fn is_elevated() -> bool {
     running_as_admin()
 }
 
-// Older builds let the in-app updater install a newer Xray that breaks the
-// WebSocket upgrade on Cloudflare-fronted servers. Heal silently at startup so
-// the user never has to know a bad core was installed.
-fn heal_pinned_core_at_startup() {
-    let current = get_core_version_sync()
-        .unwrap_or_default()
-        .trim()
-        .trim_start_matches('v')
-        .trim_start_matches('V')
-        .to_string();
-    if current == VALIDATED_XRAY_VERSION {
-        return;
-    }
-    match rollback_xray_core() {
-        Ok(ver) => app_log(&format!("startup: restored validated Xray core {ver} (was {current})")),
-        Err(e) => app_log(&format!("startup: core version {current} is not validated ({e})")),
-    }
-}
-
 // Roll back the xray core to the .bak files created during the last update.
 #[tauri::command]
 fn rollback_xray_core() -> Result<String, String> {
@@ -3259,14 +3240,6 @@ async fn check_xray_core_update() -> Result<Option<Value>, String> {
 
     // strip "v" prefix for comparison
     let remote_ver = tag.trim_start_matches('v').trim_start_matches('V').to_string();
-
-    // Only the validated core is offered. Newer Xray releases break VLESS/WS
-    // on Cloudflare for our servers (WS upgrade returns EOF), which showed up
-    // as a "connected but no internet / very slow" tunnel. Never suggest one.
-    if remote_ver != VALIDATED_XRAY_VERSION {
-        return Ok(None);
-    }
-
     let cur = tokio::task::spawn_blocking(get_core_version_sync)
         .await
         .ok()
@@ -3919,9 +3892,6 @@ pub fn run() {
             // first webview paint. `connect` waits for the flag below.
             std::thread::spawn(|| {
                 app_log(&format!("app start v{}", APP_VERSION));
-                // Heal a bad core installed by the old in-app updater before
-                // any connect can pick it up.
-                heal_pinned_core_at_startup();
                 restore_stale_proxy();
                 clear_tunnel_host_route();
                 restore_singbox_tun_state();
@@ -4042,6 +4012,10 @@ mod tests {
         // after idle" without restarting anything.
         assert_eq!(ws["heartbeatPeriod"], 20);
         assert_eq!(ws["path"], "/?ed=2560");
+        // Both old (headers.Host) and new (host) WS fields are emitted so the
+        // config works on 26.3.x and 26.11.x alike.
+        assert_eq!(ws["headers"]["Host"], "smp.settminpaing.mm.am");
+        assert_eq!(ws["host"], "smp.settminpaing.mm.am");
     }
 
     #[test]
