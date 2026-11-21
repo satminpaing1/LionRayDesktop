@@ -1272,7 +1272,7 @@ function App() {
               </p>
             </section>
 
-            <section className="home-panel">
+            <section className={`home-panel ${connected ? "on" : ""}`}>
               <button className={`server-row ${connected ? "on" : ""}`} onClick={() => setTab("servers")}>
                 <span className={`server-avatar ${connected ? "on" : ""}`}>
                   {activeServer && connected && exitInfo?.countryCode
