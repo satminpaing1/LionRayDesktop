@@ -1,6 +1,6 @@
 {
   "productName": "LionRay VPN",
-  "version": "1.8.39",
+  "version": "1.8.40",
   "identifier": "com.lionray.vpn.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",

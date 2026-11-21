@@ -129,6 +129,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   border-radius: 14px;
   box-shadow: inset 0 -2px 0 var(--primary);
 }
+.topbar.on { box-shadow: inset 0 -2px 0 var(--green); }
 .home-top { padding-bottom: 2px; }
 .brand { display: flex; align-items: center; gap: 9px; min-width: 0; }
 .brand-mark {

@@ -371,15 +371,15 @@ function LiveStats() {
     <div className="stat-grid">
       <div className="stat">
         <span className="stat-label"><Icon name="download" size={12} /> Download</span>
-        <b className="stat-val">{speeds.down}</b>
+        <b className="stat-val" style={{ color: "var(--primary)" }}>{speeds.down}</b>
       </div>
       <div className="stat">
         <span className="stat-label"><Icon name="upload" size={12} /> Upload</span>
-        <b className="stat-val">{speeds.up}</b>
+        <b className="stat-val" style={{ color: "var(--green)" }}>{speeds.up}</b>
       </div>
       <div className="stat" title={`This session: ${fmtBytes(totals.down)} down · ${fmtBytes(totals.up)} up`}>
         <span className="stat-label"><Icon name="timer" size={12} /> Session</span>
-        <b className="stat-val">{fmtTime(elapsed)}</b>
+        <b className="stat-val" style={{ color: "var(--amber)" }}>{fmtTime(elapsed)}</b>
       </div>
     </div>
   );
@@ -1233,7 +1233,7 @@ function App() {
       {/* ═══════════ HOME ═══════════ */}
       {tab === "home" && (
         <>
-          <header className="topbar home-top">
+          <header className={`topbar home-top ${connected ? "on" : ""}`}>
             <div className="brand">
               <div className="brand-mark">🦁</div>
               <div className="brand-text">
