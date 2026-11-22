@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.49";
+pub const APP_VERSION: &str = "1.8.50";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -1196,7 +1196,17 @@ fn generate_config(
     };
     let mut proxy_stream = build_stream(server);
     // Low latency for interactive traffic; Nagle only adds delay here.
-    let mut sockopt = json!({ "tcpNoDelay": true });
+    // Keep-alive matters more: without it a dead peer leaves Xray holding a
+    // half-open socket and every request hangs for minutes ("line feels bad").
+    // With it a broken link is dropped in ~60 s and the next request simply
+    // opens a fresh connection instead of stalling.
+    let mut sockopt = json!({
+        "tcpNoDelay": true,
+        "tcpKeepAliveIdle": 30,
+        "tcpKeepAliveInterval": 10,
+        "tcpKeepAliveProbeCount": 3,
+        "tcpFastOpen": true
+    });
     if fragment.is_some() {
         sockopt["dialerProxy"] = json!("fragment");
     }
@@ -1228,10 +1238,20 @@ fn generate_config(
         outbounds.push(json!({ "tag": "direct", "protocol": "freedom" }));
     } else {
         // Bypass/direct traffic must never dial IPv6 when IPv6 is disabled.
+        // `settings.domainStrategy` is the legacy location (older cores) and
+        // `sockopt.domainStrategy` the current one; emit both. Direct sockets
+        // get the same keep-alive as the tunnel so bypassed traffic never
+        // hangs on a dead peer either.
         outbounds.push(json!({
             "tag": "direct",
             "protocol": "freedom",
-            "settings": { "domainStrategy": "UseIPv4" }
+            "settings": { "domainStrategy": "UseIPv4" },
+            "streamSettings": { "sockopt": {
+                "domainStrategy": "UseIPv4",
+                "tcpKeepAliveIdle": 30,
+                "tcpKeepAliveInterval": 10,
+                "tcpKeepAliveProbeCount": 3
+            } }
         }));
     }
     outbounds.push(json!({ "tag": "block", "protocol": "blackhole" }));
