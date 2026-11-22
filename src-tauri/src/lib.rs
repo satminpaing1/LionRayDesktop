@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.51";
+pub const APP_VERSION: &str = "1.8.52";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -460,6 +460,80 @@ fn socks_listening() -> bool {
                 .is_ok()
         })
         .unwrap_or(false)
+}
+
+// A crash or force-killed app leaves its xray/sing-box child running as an
+// orphan: it keeps holding10808/10809, so the startup stale-proxy heal is
+// skipped (the port looks alive) and every later connect verifies THROUGH
+// the orphan's dead tunnel - "Server is not responding" while the real
+// server is fine. Only a reboot used to clear it. Kill only cores that live
+// in OUR bundle; the user's own xray/sing-box tools are never touched, and
+// a second running LionRay instance is left alone too.
+#[cfg(target_os = "windows")]
+fn kill_stale_cores() -> bool {
+    let mut dirs: Vec<String> = Vec::new();
+    for p in [find_xray_binary().ok(), find_singbox_binary().ok()]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(d) = p.parent() {
+            let s = d.to_string_lossy().to_string();
+            if !dirs.contains(&s) {
+                dirs.push(s);
+            }
+        }
+    }
+    if dirs.is_empty() {
+        return false;
+    }
+    let list = dirs
+        .iter()
+        .map(|d| format!("'{}\\*'", d.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(",");
+    let script = format!(
+        "if (@(Get-Process -Name lionray-desktop -ErrorAction SilentlyContinue).Count -gt 1) {{ exit 0 }}; \
+         $dirs=@({list}); \
+         Get-Process -Name xray,sing-box -ErrorAction SilentlyContinue | Where-Object {{ $p=$_.Path; $p -and ($dirs | Where-Object {{ $p -like $_ }}) }} | ForEach-Object {{ Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue; Write-Output $_.Name }}"
+    );
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &script]);
+    hide_window(&mut cmd);
+    match cmd.output() {
+        Ok(o) => !String::from_utf8_lossy(&o.stdout).trim().is_empty(),
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn kill_stale_cores() -> bool {
+    false
+}
+
+// The local port must be free BEFORE xray spawns, otherwise the readiness
+// check can pass against a foreign holder and connect through its dead
+// tunnel. Kills our own orphan once; any other owner is reported clearly
+// instead of being touched.
+fn ensure_local_ports_free() -> Result<(), String> {
+    if !socks_listening() {
+        return Ok(());
+    }
+    if kill_stale_cores() {
+        app_log("cleared an orphaned core from a previous session (it held the local port)");
+        for _ in 0..80 {
+            if !socks_listening() {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+    if socks_listening() {
+        return Err(
+            "Local port10808 is in use by another program or LionRay instance - close it and retry"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 // ── diagnostics ─────────────────────────────────────────────
@@ -2704,6 +2778,15 @@ fn establish(
             let _ = c.wait();
         }
     }
+    // The ports must be genuinely free before spawning: an orphaned core
+    // from a crashed session would otherwise answer the readiness probe and
+    // make verify run through its dead tunnel ("Server is not responding"
+    // while the real server is fine - the classic reboot-only recovery).
+    if let Err(e) = ensure_local_ports_free() {
+        restore_proxy();
+        app_log(&format!("connect blocked: {e}"));
+        return Err(e);
+    }
 
     // Dial the HOSTNAME, never a pre-resolved IP. Cloudflare edge IPs rotate;
     // pinning one IP at connect time left Xray dialing a dead colo after idle
@@ -3913,6 +3996,15 @@ pub fn run() {
             // first webview paint. `connect` waits for the flag below.
             std::thread::spawn(|| {
                 app_log(&format!("app start v{}", APP_VERSION));
+                // A crashed/force-killed previous session can leave our core
+                // running and holding the local port. While it lives, the
+                // stale-proxy heal below would be skipped (port looks alive)
+                // and every connect would verify through its dead tunnel.
+                // Clear it FIRST so startup always reaches a clean state and
+                // the line works again without a reboot.
+                if let Err(e) = ensure_local_ports_free() {
+                    app_log(&format!("startup: {e}"));
+                }
                 restore_stale_proxy();
                 clear_tunnel_host_route();
                 restore_singbox_tun_state();
