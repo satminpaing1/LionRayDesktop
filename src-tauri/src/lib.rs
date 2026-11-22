@@ -1,10 +1,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.48";
+pub const APP_VERSION: &str = "1.8.49";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -25,11 +25,7 @@ static AUTO: AtomicBool = AtomicBool::new(false);
 // last successful connection, replayed by the watchdog when the tunnel dies
 static LAST: Mutex<Option<LastConnect>> = Mutex::new(None);
 // consecutive tunnel probe failures (keep-warm); triggers auto-reconnect at 3
-static TUNNEL_FAILS: AtomicU32 = AtomicU32::new(0);
-static RECONNECTING: AtomicBool = AtomicBool::new(false);
-// Do not churn the core: a bad core or a flaky CDN must not produce a restart
-// every few seconds, which is far worse for the user than a brief stall.
-static LAST_CORE_REFRESH: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
 
 #[derive(Clone)]
 struct LastConnect {
@@ -164,49 +160,46 @@ fn set_keep_awake(on: bool) {
 #[cfg(not(windows))]
 fn set_keep_awake(_on: bool) {}
 
-// One real request through the active data path. Used both by the keep-warm
-// loop and to verify a refresh actually restored the tunnel.
-fn tunnel_probe() -> bool {
+// Send tiny requests through the ACTIVE data path. The result is deliberately
+// ignored: a slow or flaky probe target must never trigger a teardown. This
+// only exists to keep the WebSocket warm, exactly like a well-known VPN's
+// idle keep-alive.
+fn warm_tunnel() {
     let tun_on = TUN_CHILD.lock().map(|g| g.is_some()).unwrap_or(false);
-    let mut builder = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(5));
-    if !tun_on {
+    if tun_on {
+        // TUN mode owns the default route, so a plain request enters it.
+        let _ = probe_urls_race_direct(&PROBE_URLS, 3);
+    } else {
         // Proxy mode: Xray's SOCKS port is the real data path.
-        match reqwest::Proxy::all(format!("socks5h://127.0.0.1:{SOCKS_PORT}")) {
-            Ok(p) => builder = builder.proxy(p),
-            Err(_) => return false,
-        }
+        let _ = probe_urls_race_socks(&PROBE_URLS, 3);
     }
-    // TUN mode owns the default route, so a plain request enters it.
-    if let Ok(client) = builder.build() {
-        if let Ok(resp) = client.get("http://www.gstatic.com/generate_204").send() {
-            return resp.status().is_success() || resp.status().as_u16() == 204;
-        }
-    }
-    false
 }
 
-// Keep the tunnel warm independently of the WebView. Minimized windows get
-// their timers throttled by Chromium, so this native loop is the one that both
-// keeps the path alive and notices a stall immediately. A single failure is
-// never enough to yank the connection: we first refresh only the Xray core
-// (system proxy/TUN stay put, so the UI does not flip), and only escalate to
-// a full reconnect if the refresh does not restore the path.
+const PROBE_URLS: &[&str] = &[
+    "http://cp.cloudflare.com/generate_204",
+    "http://www.gstatic.com/generate_204",
+    "http://www.msftconnecttest.com/connecttest.txt",
+];
+
+// Keep the tunnel warm independently of the WebView, and watch only for the
+// one thing that genuinely needs a repair: the core/TUN process exiting. This
+// loop NEVER restarts or reconnects anything by itself - a flaky probe or a
+// slow CDN must not be able to churn the connection, which is exactly what
+// made previous builds feel unstable. Idle survival comes from the WS
+// heartbeat (20 s) plus hostname dialing, not from a watchdog.
 fn start_tunnel_keepalive() {
     std::thread::spawn(|| {
         // Let startup cleanup / an auto-connect settle before the first tick.
         std::thread::sleep(std::time::Duration::from_secs(8));
         loop {
-            // 6 s cadence: a stalled tunnel is noticed in ~12 s and repaired
-            // before the user reaches for the browser. The probe is a tiny
-            // generate_204 request, so this costs almost nothing.
-            std::thread::sleep(std::time::Duration::from_secs(6));
+            // 10 s cadence keeps the WebSocket warm while the PC is idle.
+            std::thread::sleep(std::time::Duration::from_secs(10));
             if !CONNECTED.load(Ordering::SeqCst) || CONNECTING.load(Ordering::SeqCst) {
                 continue;
             }
-            // Watch core/TUN health here too: when the window is minimized the
-            // webview heartbeat is throttled, so this native loop still
-            // notices a process death and repairs the machine in time.
+            // When the window is minimized the webview heartbeat is throttled,
+            // so this native loop still notices a process death and restores
+            // Windows networking in time (the user reconnects by hand).
             if !core_is_alive() {
                 CONNECTED.store(false, Ordering::SeqCst);
                 spawn_network_repair("core exit (keep-warm)");
@@ -217,55 +210,7 @@ fn start_tunnel_keepalive() {
                 spawn_network_repair("TUN exit (keep-warm)");
                 continue;
             }
-            if tunnel_probe() {
-                TUNNEL_FAILS.store(0, Ordering::SeqCst);
-                continue;
-            }
-
-            let fails = TUNNEL_FAILS.fetch_add(1, Ordering::SeqCst) + 1;
-            app_log(&format!("keep-warm: tunnel probe failed ({fails})"));
-            if fails < 2 || RECONNECTING.load(Ordering::SeqCst) {
-                continue;
-            }
-            TUNNEL_FAILS.store(0, Ordering::SeqCst);
-
-            // Recovery cooldown: never churn the core/connection more than
-            // once every 2 minutes. Repeated restarts are what actually make
-            // browsing feel slow, far worse than a brief stalled request.
-            {
-                let mut last = LAST_CORE_REFRESH.lock().unwrap_or_else(|e| e.into_inner());
-                let now = std::time::Instant::now();
-                if let Some(t) = *last {
-                    if now.duration_since(t) < std::time::Duration::from_secs(120) {
-                        continue;
-                    }
-                }
-                *last = Some(now);
-            }
-
-            // Step 1: transparent core refresh. The local proxy port keeps
-            // answering the whole time, so apps and the UI see no flip.
-            if soft_restart_core() {
-                std::thread::sleep(std::time::Duration::from_secs(1));
-                if tunnel_probe() {
-                    app_log("keep-warm: core refresh restored the tunnel");
-                    continue;
-                }
-            }
-
-            // Step 2: the stall survived a fresh core - repair the whole
-            // network state and replay the last successful connection.
-            CONNECTED.store(false, Ordering::SeqCst);
-            spawn_network_repair("idle tunnel (keep-warm)");
-            std::thread::spawn(|| {
-                for _ in 0..200 {
-                    if !NET_REPAIRING.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                reconnect_last();
-            });
+            warm_tunnel();
         }
     });
 }
@@ -491,28 +436,14 @@ fn verify_tunnel_ready() -> bool {
     // This server needs ~2 s per 204 probe. URLs are raced in parallel so a
     // healthy tunnel still returns in ~2 s; the 6 s budget only prevents false
     // "Server is not responding" failures on a slow-but-working line.
-    probe_urls_race_socks(
-        &[
-            "http://cp.cloudflare.com/generate_204",
-            "http://www.gstatic.com/generate_204",
-            "http://www.msftconnecttest.com/connecttest.txt",
-        ],
-        6,
-    )
+    probe_urls_race_socks(PROBE_URLS, 6)
 }
 
 fn verify_tun_ready() -> bool {
     // TUN/DNS/route setup can take a few seconds after the adapter appears.
     // Real traffic through the adapter is the only proof it actually works;
     // a route-table entry alone can exist while packets never enter the TUN.
-    probe_urls_race_direct(
-        &[
-            "http://cp.cloudflare.com/generate_204",
-            "http://www.gstatic.com/generate_204",
-            "http://www.msftconnecttest.com/connecttest.txt",
-        ],
-        6,
-    )
+    probe_urls_race_direct(PROBE_URLS, 6)
 }
 
 #[cfg(target_os = "windows")]
@@ -2858,110 +2789,6 @@ async fn connect(
     } else {
         "Connected via System Proxy".into()
     })
-}
-
-// Refresh only the Xray core when the tunnel is stalled but the local proxy
-// path is still intact. System proxy / TUN / routes are left untouched, so
-// browsers keep talking to 127.0.0.1:10808 and the UI never shows a drop.
-fn soft_restart_core() -> bool {
-    if RECONNECTING.swap(true, Ordering::SeqCst) {
-        return false;
-    }
-    let result = (|| {
-        let Some(lc) = LAST.lock().ok().and_then(|g| g.clone()) else {
-            return false;
-        };
-        // A fresh config forces a new WebSocket session; the hostname dial
-        // also lets Xray pick a current Cloudflare edge on the next request.
-        match establish(
-            &lc.server, &lc.routing, &lc.dns, lc.ad_block, &lc.bypass,
-            lc.tun, lc.udp, lc.ipv6, lc.fragment,
-        ) {
-            Ok(_) => {
-                app_log("core refreshed (system proxy untouched)");
-                true
-            }
-            Err(e) => {
-                app_log(&format!("core refresh failed: {e}"));
-                false
-            }
-        }
-    })();
-    RECONNECTING.store(false, Ordering::SeqCst);
-    result
-}
-
-// Auto-recover a stalled tunnel using the last successful connection params.
-// Only runs when the user intended to stay connected (AUTO == true); a manual
-// disconnect sets AUTO=false so this never resurrects a closed session.
-fn reconnect_last() {
-    if !AUTO.load(Ordering::SeqCst) {
-        return;
-    }
-    let last = match LAST.lock() {
-        Ok(g) => g.clone(),
-        Err(_) => None,
-    };
-    let Some(lc) = last else {
-        app_log("auto-reconnect: no saved connection");
-        return;
-    };
-    if RECONNECTING.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    CONNECTING.store(true, Ordering::SeqCst);
-    std::thread::spawn(move || {
-        for _ in 0..200 {
-            if !NET_REPAIRING.load(Ordering::SeqCst) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        cleanup();
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        let mut last_err = String::new();
-        let mut success = false;
-        let mut tun_eff = false;
-        for attempt in 1..=3 {
-            app_log(&format!("auto-reconnect attempt {attempt}"));
-            match establish(
-                &lc.server,
-                &lc.routing,
-                &lc.dns,
-                lc.ad_block,
-                &lc.bypass,
-                lc.tun,
-                lc.udp,
-                lc.ipv6,
-                lc.fragment,
-            ) {
-                Ok(t) => {
-                    tun_eff = t;
-                    success = true;
-                    break;
-                }
-                Err(e) => {
-                    last_err = e;
-                    app_log(&format!("auto-reconnect attempt {attempt} failed: {last_err}"));
-                    cleanup();
-                    std::thread::sleep(std::time::Duration::from_secs(3));
-                }
-            }
-        }
-        CONNECTING.store(false, Ordering::SeqCst);
-        if success {
-            AUTO.store(true, Ordering::SeqCst);
-            CONNECTED.store(true, Ordering::SeqCst);
-            app_log(&format!(
-                "auto-reconnect ok: {}:{} (tun={})",
-                lc.server.address, lc.server.port, tun_eff
-            ));
-        } else {
-            app_log(&format!("auto-reconnect failed: {last_err}"));
-            CONNECTED.store(false, Ordering::SeqCst);
-        }
-        RECONNECTING.store(false, Ordering::SeqCst);
-    });
 }
 
 #[tauri::command]

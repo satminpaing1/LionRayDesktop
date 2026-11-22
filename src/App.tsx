@@ -410,7 +410,7 @@ function App() {
   const [qrOpen, setQrOpen] = useState(false);
   const [exitInfo, setExitInfo] = useState<ExitInfo | null>(null);
   const [coreVer, setCoreVer] = useState("...");
-  // xray core updates are intentionally disabled (see backend PINNED_XRAY_VERSION)
+  // optional Xray core update; a backup of the previous core is kept for rollback
   const [xrayUpdate, setXrayUpdate] = useState<{ version: string; url: string } | null>(null);
   const [xrayUpdating, setXrayUpdating] = useState(false);
   const [xrayProgress, setXrayProgress] = useState(0);
