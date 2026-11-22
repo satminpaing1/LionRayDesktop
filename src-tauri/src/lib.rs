@@ -1,10 +1,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.50";
+pub const APP_VERSION: &str = "1.8.51";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -24,8 +24,12 @@ static NET_REPAIRING: AtomicBool = AtomicBool::new(false);
 static AUTO: AtomicBool = AtomicBool::new(false);
 // last successful connection, replayed by the watchdog when the tunnel dies
 static LAST: Mutex<Option<LastConnect>> = Mutex::new(None);
-// consecutive tunnel probe failures (keep-warm); triggers auto-reconnect at 3
-
+// Idle self-heal state: consecutive full data-path probe failures, total
+// failed auto-recover attempts (drives the retry backoff), and when the last
+// attempt started (cooldown so a crash-looping core can never become churn).
+static DEAD_PROBE_STREAK: AtomicU32 = AtomicU32::new(0);
+static AUTO_RETRIES: AtomicU32 = AtomicU32::new(0);
+static LAST_AUTO_FIX: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 
 #[derive(Clone)]
 struct LastConnect {
@@ -181,36 +185,196 @@ const PROBE_URLS: &[&str] = &[
     "http://www.msftconnecttest.com/connecttest.txt",
 ];
 
-// Keep the tunnel warm independently of the WebView, and watch only for the
-// one thing that genuinely needs a repair: the core/TUN process exiting. This
-// loop NEVER restarts or reconnects anything by itself - a flaky probe or a
-// slow CDN must not be able to churn the connection, which is exactly what
-// made previous builds feel unstable. Idle survival comes from the WS
-// heartbeat (20 s) plus hostname dialing, not from a watchdog.
+// True when Xray's local SOCKS port still accepts connections. A core can
+// stay "alive" as a process yet stop serving (hang), which blackholes every
+// app while the UI happily says Connected.
+fn local_socks_alive() -> bool {
+    use std::net::TcpStream;
+    let Ok(addr) = format!("127.0.0.1:{SOCKS_PORT}").parse::<std::net::SocketAddr>() else {
+        return true;
+    };
+    TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(1)).is_ok()
+}
+
+// While WE are the VPN, the Windows system proxy must keep pointing at the
+// local core. Another program (or Windows itself re-applying a PAC after a
+// network change) can silently overwrite it: browsing then bypasses the
+// tunnel entirely - the classic "app says Connected but VPN doesn't work"
+// after the PC has been idle. Re-asserting is a registry write only; no
+// connection is ever touched, so this can never cause churn.
+#[cfg(target_os = "windows")]
+fn reassert_system_proxy() {
+    if system_proxy_is_ours() {
+        return;
+    }
+    app_log("system proxy was changed externally - restoring the VPN proxy");
+    reg_set_value("ProxyServer", "REG_SZ", &format!("127.0.0.1:{HTTP_PORT}"));
+    reg_set_value("ProxyEnable", "REG_DWORD", "1");
+    // A PAC script overrides the manual proxy; while we are connected it must
+    // not exist, exactly like at connect time.
+    reg_delete_value("AutoConfigURL");
+    reg_set_value("AutoDetect", "REG_DWORD", "0");
+    refresh_system_proxy();
+}
+
+#[cfg(not(target_os = "windows"))]
+fn reassert_system_proxy() {}
+
+// Bring the tunnel back without user action. Safe to call from both the
+// webview heartbeat and the native keep-warm loop at the same time: guards
+// are user intent (AUTO), a saved connection, a single in-flight attempt
+// (CONNECTING) and a backoff window (30 s for the first attempts, 2 min
+// afterwards). On failure the machine is already back on the user's own
+// network - reset/restore ran first - so nothing else is torn down; the
+// keep-warm loop simply retries later and self-heals when the line returns.
+fn spawn_auto_recover() -> bool {
+    if !AUTO.load(Ordering::SeqCst) || NET_REPAIRING.load(Ordering::SeqCst) {
+        return false;
+    }
+    if !LAST.lock().map(|g| g.is_some()).unwrap_or(false) {
+        return false;
+    }
+    if CONNECTING.load(Ordering::SeqCst) {
+        return true; // a connect or recovery is already in flight
+    }
+    let wait = if AUTO_RETRIES.load(Ordering::SeqCst) < 3 { 30 } else { 120 };
+    {
+        let mut last = LAST_AUTO_FIX.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = *last {
+            if t.elapsed().as_secs() < wait {
+                return CONNECTING.load(Ordering::SeqCst);
+            }
+        }
+        *last = Some(std::time::Instant::now());
+    }
+    if CONNECTING.swap(true, Ordering::SeqCst) {
+        return true;
+    }
+    std::thread::spawn(run_auto_recover);
+    true
+}
+
+fn run_auto_recover() {
+    let lc = LAST.lock().ok().and_then(|g| g.clone());
+    let Some(lc) = lc else {
+        CONNECTING.store(false, Ordering::SeqCst);
+        return;
+    };
+    if !AUTO.load(Ordering::SeqCst) {
+        // The user disconnected between the guard and now - never resurrect.
+        CONNECTING.store(false, Ordering::SeqCst);
+        return;
+    }
+    app_log("auto-recover: re-establishing tunnel");
+    // Immediate machine repair first: the user's own proxy/PAC comes back
+    // before we re-verify, so browsing is never left aimed at a dead port.
+    reset_tunnel_state();
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    let result = establish(
+        &lc.server, &lc.routing, &lc.dns, lc.ad_block, &lc.bypass,
+        lc.tun, lc.udp, lc.ipv6, lc.fragment,
+    );
+    match result {
+        Ok(_) => {
+            if AUTO.load(Ordering::SeqCst) {
+                AUTO_RETRIES.store(0, Ordering::SeqCst);
+                DEAD_PROBE_STREAK.store(0, Ordering::SeqCst);
+                app_log("auto-recover: tunnel restored");
+            } else {
+                // Disconnect landed while we were recovering - do not resurrect it.
+                cleanup();
+            }
+        }
+        Err(e) => {
+            AUTO_RETRIES.fetch_add(1, Ordering::SeqCst);
+            app_log(&format!("auto-recover failed: {e} - will retry in the background"));
+        }
+    }
+    CONNECTING.store(false, Ordering::SeqCst);
+}
+
+// Keep the tunnel warm independently of the WebView, keep Windows networking
+// pointed at us, and recover automatically when something really dies.
+// Deliberately conservative so a flaky probe can never churn a healthy
+// connection (the exact failure that made v1.8.48 feel unstable):
+//   * the system proxy is only RE-ASSERTED (registry write) when something
+//     external overwrote it - no connection is touched;
+//   * the data path is fully verified once a minute and only 3 straight
+//     failures (~3 min) trigger a single, backed-off re-establish;
+//   * a dead core/TUN/local-port gets one immediate re-establish attempt.
 fn start_tunnel_keepalive() {
     std::thread::spawn(|| {
         // Let startup cleanup / an auto-connect settle before the first tick.
         std::thread::sleep(std::time::Duration::from_secs(8));
+        let mut tick: u32 = 0;
         loop {
-            // 10 s cadence keeps the WebSocket warm while the PC is idle.
-            std::thread::sleep(std::time::Duration::from_secs(10));
-            if !CONNECTED.load(Ordering::SeqCst) || CONNECTING.load(Ordering::SeqCst) {
+            // 15 s cadence: a stolen proxy is repaired within 15 s, warm
+            // traffic keeps the WebSocket alive while the PC is idle.
+            std::thread::sleep(std::time::Duration::from_secs(15));
+            tick = tick.wrapping_add(1);
+            if CONNECTING.load(Ordering::SeqCst) {
+                continue; // a user connect or an auto-recovery is running
+            }
+            if !CONNECTED.load(Ordering::SeqCst) {
+                // Broken but the user still wants to be connected: keep
+                // trying to come back (spawn_auto_recover applies backoff).
+                if AUTO.load(Ordering::SeqCst) {
+                    spawn_auto_recover();
+                }
                 continue;
             }
-            // When the window is minimized the webview heartbeat is throttled,
-            // so this native loop still notices a process death and restores
-            // Windows networking in time (the user reconnects by hand).
+            // Process death: re-establish immediately, else repair honestly.
             if !core_is_alive() {
-                CONNECTED.store(false, Ordering::SeqCst);
-                spawn_network_repair("core exit (keep-warm)");
+                if !spawn_auto_recover() {
+                    CONNECTED.store(false, Ordering::SeqCst);
+                    spawn_network_repair("core exit (keep-warm)");
+                }
                 continue;
             }
             if tunnel_mode_is_tun() && !tun_alive() {
-                CONNECTED.store(false, Ordering::SeqCst);
-                spawn_network_repair("TUN exit (keep-warm)");
+                if !spawn_auto_recover() {
+                    CONNECTED.store(false, Ordering::SeqCst);
+                    spawn_network_repair("TUN exit (keep-warm)");
+                }
                 continue;
             }
-            warm_tunnel();
+            if !tunnel_mode_is_tun() {
+                // A hung core keeps its process but stops serving: the local
+                // port check notices that, the proxy re-assert notices an
+                // external overwrite. Neither ever restarts a healthy tunnel.
+                if !local_socks_alive() {
+                    if !spawn_auto_recover() {
+                        CONNECTED.store(false, Ordering::SeqCst);
+                        spawn_network_repair("core hung (keep-warm)");
+                    }
+                    continue;
+                }
+                if !NET_REPAIRING.load(Ordering::SeqCst) {
+                    reassert_system_proxy();
+                }
+            }
+            // Full data-path verification once a minute (every 4th tick);
+            // light warm traffic on the other ticks.
+            if tick % 4 == 0 {
+                let tun_on = tunnel_mode_is_tun();
+                let ok = if tun_on {
+                    probe_urls_race_direct(PROBE_URLS, 7)
+                } else {
+                    probe_urls_race_socks(PROBE_URLS, 7)
+                };
+                if ok {
+                    DEAD_PROBE_STREAK.store(0, Ordering::SeqCst);
+                } else {
+                    let s = DEAD_PROBE_STREAK.fetch_add(1, Ordering::SeqCst) + 1;
+                    app_log(&format!("keep-warm: data path unreachable ({s}/3)"));
+                    if s >= 3 {
+                        DEAD_PROBE_STREAK.store(0, Ordering::SeqCst);
+                        spawn_auto_recover();
+                    }
+                }
+            } else {
+                warm_tunnel();
+            }
         }
     });
 }
@@ -2718,6 +2882,14 @@ async fn connect(
     ipv6: Option<bool>,
     fragment: Option<bool>,
 ) -> Result<String, String> {
+    // An auto-recovery may be mid-flight; wait for it instead of racing a
+    // second establish (the loser would fail to bind the local ports).
+    for _ in 0..240 {
+        if !CONNECTING.load(Ordering::SeqCst) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     if CONNECTED.load(Ordering::SeqCst) {
         // A core can die while the webview is throttled and leave CONNECTED
         // stale. Repair it here instead of trapping the user in "already
@@ -2786,6 +2958,8 @@ async fn connect(
     };
 
     AUTO.store(true, Ordering::SeqCst);
+    DEAD_PROBE_STREAK.store(0, Ordering::SeqCst);
+    AUTO_RETRIES.store(0, Ordering::SeqCst);
     app_log(&format!(
         "connect ok: {}:{} tun_req={} tun_ok={} udp={} ipv6={} fragment={}",
         server.address, server.port, tun_on, tun_effective, udp_on, ipv6_on, fragment_on
@@ -2828,18 +3002,18 @@ fn is_connected() -> bool {
     if !CONNECTED.load(Ordering::SeqCst) {
         return false;
     }
-    // Detect a crashed core immediately. Restore the machine's own network
-    // settings at once — leaving the Windows proxy enabled with nothing
-    // listening is what used to make the whole PC offline until a reboot.
-    if !core_is_alive() {
+    // Detect a crashed core immediately. First try to bring the tunnel back
+    // on our own (the user's intent is still "connected"); only when that is
+    // impossible do we restore the machine's network settings - leaving the
+    // Windows proxy enabled with nothing listening is what used to make the
+    // whole PC offline until a reboot.
+    if !core_is_alive() || (tunnel_mode_is_tun() && !tun_alive()) {
+        if spawn_auto_recover() {
+            return true; // recovery in flight; the UI stays green for a few seconds
+        }
         CONNECTED.store(false, Ordering::SeqCst);
         app_log("core exited unexpectedly - restoring network settings");
         spawn_network_repair("core exit");
-        return false;
-    }
-    if tunnel_mode_is_tun() && !tun_alive() {
-        CONNECTED.store(false, Ordering::SeqCst);
-        spawn_network_repair("TUN exit");
         return false;
     }
     true
