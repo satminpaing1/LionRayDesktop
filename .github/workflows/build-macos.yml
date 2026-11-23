@@ -1,32 +1,45 @@
 name: Build macOS (universal dmg)
 
-# One-shot universal macOS build (Apple Silicon + Intel in a single .dmg):
-#   * manual run  -> needs app_version, optional Xray pin
-#   * tag push    -> app version comes from the tag (v1.6.0)
-# The release uses a separate `-macos` tag so it never overwrites the Windows
-# release notes or its installer asset.
+# Build-only workflow. Publishing is done by build-release.yml, which waits for
+# both Windows and macOS artifacts and creates ONE GitHub Release for them.
+#
+# The .dmg is genuinely universal: the Tauri app is built for x86_64 + aarch64
+# and the two Xray binaries are merged with lipo, so one file runs on Intel and
+# Apple Silicon without Rosetta.
 
 on:
-  workflow_dispatch:
+  workflow_call:
     inputs:
       app_version:
-        description: 'App version to build & release (e.g. 1.8.57)'
+        description: 'App version to build'
         required: true
         type: string
       xray_version:
-        description: 'Optional: pin Xray core tag (default v26.3.27 - validated)'
+        description: 'Xray core version (e.g. 26.11.9)'
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      app_version:
+        description: 'App version to build (debug builds do not publish)'
+        required: true
+        type: string
+      xray_version:
+        description: 'Optional: override Xray core version (empty = release-config.json)'
         required: false
         type: string
-        default: 'v26.3.27'
-  push:
-    tags:
-      - "v*"
+        default: ''
+
+concurrency:
+  group: lionray-macos-${{ inputs.app_version || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   macos:
     runs-on: macos-latest
+    timeout-minutes: 90
     permissions:
-      contents: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -42,14 +55,37 @@ jobs:
       - name: Install frontend deps
         run: npm install
 
+      - name: Resolve versions
+        id: ver
+        run: |
+          set -e
+          APP="${{ inputs.app_version }}"
+          if [ -z "$APP" ] && [ "${{ github.ref_type }}" = "tag" ]; then
+            APP="${{ github.ref_name }}"
+            APP="${APP#v}"
+          fi
+          if [ -z "$APP" ]; then
+            APP=$(jq -r '.app // empty' release-config.json)
+          fi
+          [ -n "$APP" ] || { echo "app version is missing"; exit 1; }
+          echo "app=$APP" >> "$GITHUB_OUTPUT"
+
+          XRAY="${{ inputs.xray_version }}"
+          [ -n "$XRAY" ] || XRAY=$(jq -r .xray release-config.json)
+          XRAY="${XRAY#v}"
+          echo "xray=$XRAY" >> "$GITHUB_OUTPUT"
+          echo "xray_tag=v$XRAY" >> "$GITHUB_OUTPUT"
+          echo "App $APP / Xray v$XRAY"
+
       # Keep every version source in sync: dmg filename, About panel, updater.
       - name: Set app version
         run: |
-          APP_VER="${{ github.event.inputs.app_version || '1.6.0' }}"
-          echo "APP_VERSION=$APP_VER"
-          sed -i '' 's/\("version":[[:space:]]*"\)[^"]*\("\)/\1'"$APP_VER"'\2/' src-tauri/tauri.conf.json
-          sed -i '' 's/\("version":[[:space:]]*"\)[^"]*\("\)/\1'"$APP_VER"'\2/' package.json
-          sed -i '' 's/pub const APP_VERSION: &str = "[^"]*";/pub const APP_VERSION: \&str = "'"$APP_VER"'";/' src-tauri/src/lib.rs
+          set -e
+          APP="${{ steps.ver.outputs.app }}"
+          echo "APP_VERSION=$APP"
+          sed -i '' 's/\("version":[[:space:]]*"\)[^"]*\("\)/\1'"$APP"'\2/' src-tauri/tauri.conf.json
+          sed -i '' 's/\("version":[[:space:]]*"\)[^"]*\("\)/\1'"$APP"'\2/' package.json
+          sed -i '' 's/pub const APP_VERSION: &str = "[^"]*";/pub const APP_VERSION: \&str = "'"$APP"'";/' src-tauri/src/lib.rs
           grep -n '"version"' src-tauri/tauri.conf.json package.json
           grep -n 'APP_VERSION: &str' src-tauri/src/lib.rs
 
@@ -59,13 +95,7 @@ jobs:
         id: xray
         run: |
           set -e
-          TAG="${{ github.event.inputs.xray_version }}"
-          if [ -z "$TAG" ] || [ "$TAG" = "latest" ]; then
-            TAG=$(curl -fsSL --retry 5 --retry-delay 5 -o /dev/null -w '%{url_effective}' \
-                  "https://github.com/XTLS/Xray-core/releases/latest" \
-                  | sed -E 's#.*/tag/([^/]+).*#\1#')
-            [ -z "$TAG" ] && TAG="v26.3.27"
-          fi
+          TAG="${{ steps.ver.outputs.xray_tag }}"
           echo "Xray core tag: $TAG"
           mkdir -p /tmp/xray/{x86,arm}
           curl -fL --retry 5 --retry-delay 5 --retry-all-errors -o /tmp/xray/x86.zip "https://github.com/XTLS/Xray-core/releases/download/${TAG}/Xray-macos-64.zip"
@@ -74,6 +104,10 @@ jobs:
           unzip -o -q /tmp/xray/arm.zip -d /tmp/xray/arm
           lipo -create -output src-tauri/xray-bundle/xray /tmp/xray/x86/xray /tmp/xray/arm/xray
           lipo -info src-tauri/xray-bundle/xray
+          # The dat files are also tracked in the repo; only overwrite them when
+          # the release archive actually ships matching versions.
+          cp /tmp/xray/x86/geoip.dat src-tauri/xray-bundle/geoip.dat 2>/dev/null || true
+          cp /tmp/xray/x86/geosite.dat src-tauri/xray-bundle/geosite.dat 2>/dev/null || true
           VER="${TAG#v}"
           echo "${VER}" > src-tauri/xray-bundle/version.txt
           echo "xray_ver=${VER}" >> "$GITHUB_OUTPUT"
@@ -92,28 +126,10 @@ jobs:
           echo "dmg=$DMG"
           ls -lh "$DMG"
 
-      - name: Upload dmg artifacts
+      - name: Upload dmg artifact
         uses: actions/upload-artifact@v4
         with:
-          name: lionray-macos-universal
+          name: lionray-macos
           path: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
           if-no-files-found: error
-
-      - name: Create / update macOS GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ github.event.inputs.app_version || '1.6.0' }}-macos
-          name: "LionRay VPN Desktop v${{ github.event.inputs.app_version || '1.6.0' }} (Universal macOS)"
-          body: |
-            Universal macOS build for **Apple Silicon + Intel** in one .dmg.
-
-            - Xray core: ${{ steps.xray.outputs.xray_ver }} (universal binary via lipo)
-            - Same UI as Windows v${{ github.event.inputs.app_version || '1.6.0' }}
-            - System proxy is enabled only while connected and turned off on disconnect.
-
-            > Unsigned build — right-click the app and choose **Open** to bypass
-            > Gatekeeper, or run:
-            > `xattr -dr com.apple.quarantine "/Applications/LionRay VPN.app"`
-          files: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
-          fail_on_unmatched_files: true
-          overwrite_files: true
+          retention-days: 30

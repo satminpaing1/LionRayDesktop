@@ -741,9 +741,9 @@ function App() {
     };
   }, [connected]);
 
-  // Background connection heartbeat. The backend repairs Windows networking
-  // immediately when the core/TUN dies but never reconnects by itself, so this
-  // only mirrors its state and tells the user to tap Connect when ready.
+  // Background connection heartbeat. The backend repairs the network and may
+  // auto-recover the tunnel while user intent is still "connected"; this only
+  // mirrors that state, so the UI stays honest during a brief recovery window.
   useEffect(() => {
     let last: boolean | null = null;
     const heartbeat = setInterval(async () => {
@@ -752,7 +752,7 @@ function App() {
         const alive = await invoke<boolean>("is_connected");
         if (manualDisconnectRef.current) return;
         if (last !== null && last !== alive) {
-          showToast(alive ? "Connected ✓" : "Connection lost — network restored, tap Connect to retry", !alive);
+          showToast(alive ? "Connected ✓" : "Connection lost — restoring automatically", !alive);
         }
         last = alive;
         setConnected(alive);

@@ -1,0 +1,177 @@
+name: Build & Release (Windows + macOS Universal)
+
+# Single entry point for a public release.
+#   * builds the Windows NSIS installer and the macOS universal .dmg
+#   * publishes BOTH assets under ONE tag: v<app_version>
+#   * refuses to publish a version that is not newer than the latest release
+#
+# Xray / sing-box versions come from release-config.json so both platforms
+# always ship the exact same core. auto-update-core.yml bumps that file.
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_version:
+        description: 'App version to release (e.g. 1.8.58)'
+        required: true
+        type: string
+      xray_version:
+        description: 'Override Xray core version (empty = release-config.json)'
+        required: false
+        type: string
+        default: ''
+      singbox_version:
+        description: 'Override sing-box version (empty = release-config.json)'
+        required: false
+        type: string
+        default: ''
+  workflow_call:
+    inputs:
+      app_version:
+        required: true
+        type: string
+      xray_version:
+        required: false
+        type: string
+        default: ''
+      singbox_version:
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: lionray-release-${{ inputs.app_version || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      app: ${{ steps.resolve.outputs.app }}
+      xray: ${{ steps.resolve.outputs.xray }}
+      xray_tag: ${{ steps.resolve.outputs.xray_tag }}
+      singbox: ${{ steps.resolve.outputs.singbox }}
+      singbox_tag: ${{ steps.resolve.outputs.singbox_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve and guard versions
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          IN_APP: ${{ inputs.app_version }}
+          IN_XRAY: ${{ inputs.xray_version }}
+          IN_SINGBOX: ${{ inputs.singbox_version }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          APP="$IN_APP"
+          if [ -z "$APP" ] && [ "$REF_TYPE" = "tag" ]; then APP="${REF_NAME#v}"; fi
+          if [ -z "$APP" ]; then APP=$(jq -r '.app // empty' release-config.json); fi
+          [ -n "$APP" ] || { echo "app version is missing"; exit 1; }
+          if ! [[ "$APP" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "invalid app version: $APP"; exit 1
+          fi
+
+          XRAY="$IN_XRAY"
+          [ -n "$XRAY" ] || XRAY=$(jq -r .xray release-config.json)
+          XRAY="${XRAY#v}"
+
+          SINGBOX="$IN_SINGBOX"
+          [ -n "$SINGBOX" ] || SINGBOX=$(jq -r .singbox release-config.json)
+          SINGBOX="${SINGBOX#v}"
+
+          # Never overwrite an older/unrelated release. The -macos preview tag
+          # is normalised to its numeric part before comparison.
+          LATEST=""
+          if LATEST=$(gh api "repos/$REPO/releases/latest" --jq .tag_name 2>/dev/null); then
+            LV="${LATEST#v}"; LV="${LV%%[!0-9.]*}"
+            NV="${APP%%[!0-9.]*}"
+            if [ -z "$LV" ] || [ -z "$NV" ]; then
+              echo "could not compare versions: '$LATEST' vs 'v$APP'" >&2
+              exit 1
+            fi
+            if dpkg --compare-versions "$NV" le "$LV"; then
+              echo "requested v$APP is not newer than latest release $LATEST" >&2
+              exit 1
+            fi
+            echo "version guard: $LATEST -> v$APP"
+          else
+            echo "no previous release; publishing v$APP"
+          fi
+
+          echo "app=$APP" >> "$GITHUB_OUTPUT"
+          echo "xray=$XRAY" >> "$GITHUB_OUTPUT"
+          echo "xray_tag=v$XRAY" >> "$GITHUB_OUTPUT"
+          echo "singbox=$SINGBOX" >> "$GITHUB_OUTPUT"
+          echo "singbox_tag=v$SINGBOX" >> "$GITHUB_OUTPUT"
+          echo "Release v$APP | Xray v$XRAY | sing-box v$SINGBOX"
+
+  windows:
+    needs: prepare
+    uses: ./.github/workflows/build-windows.yml
+    with:
+      app_version: ${{ needs.prepare.outputs.app }}
+      xray_version: ${{ needs.prepare.outputs.xray }}
+      singbox_version: ${{ needs.prepare.outputs.singbox }}
+
+  macos:
+    needs: prepare
+    uses: ./.github/workflows/build-macos.yml
+    with:
+      app_version: ${{ needs.prepare.outputs.app }}
+      xray_version: ${{ needs.prepare.outputs.xray }}
+
+  publish:
+    needs: [prepare, windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: lionray-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: List release assets
+        run: ls -lh release-assets
+
+      - name: Verify both platforms produced an asset
+        run: |
+          set -e
+          compgen -G 'release-assets/*.exe' >/dev/null || { echo "missing Windows installer"; exit 1; }
+          compgen -G 'release-assets/*.dmg' >/dev/null || { echo "missing macOS dmg"; exit 1; }
+
+      - name: Create ONE GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.prepare.outputs.app }}
+          name: "LionRay VPN Desktop v${{ needs.prepare.outputs.app }} (Windows + macOS Universal)"
+          body: |
+            One release for both desktops - same app version, same Xray core.
+
+            **Assets**
+            - `LionRay.VPN_${{ needs.prepare.outputs.app }}_x64-setup.exe` — Windows universal (NSIS: x64 + ARM64 cores, auto-detected)
+            - `LionRay.VPN_${{ needs.prepare.outputs.app }}_universal.dmg` — macOS universal (Intel + Apple Silicon, no Rosetta)
+
+            **Bundled cores**
+            - Xray core: ${{ needs.prepare.outputs.xray }}
+            - sing-box (Windows TUN): ${{ needs.prepare.outputs.singbox }} (x64 + ARM64 bundled)
+
+            **Notes**
+            - Proxy mode restores the saved system proxy on disconnect; TUN mode
+              never touches the Windows system proxy.
+            - macOS is unsigned: right-click the app and choose **Open**, or run
+              `xattr -dr com.apple.quarantine "/Applications/LionRay VPN.app"`.
+            - Windows is unsigned: SmartScreen may ask for **More info > Run anyway**.
+          files: release-assets/*
+          fail_on_unmatched_files: true
+          overwrite_files: true

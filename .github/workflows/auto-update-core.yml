@@ -1,0 +1,109 @@
+name: Auto-update Xray core
+
+# Watches XTLS/Xray-core releases. When a newer stable core appears it:
+#   1. writes the new core version into release-config.json
+#   2. bumps the app patch version everywhere (About panel, updater, Cargo)
+#   3. commits to main
+#   4. starts build-release.yml, which publishes ONE release containing both
+#      the Windows installer and the macOS universal DMG
+#
+# Runs on a schedule (GitHub cannot push-trigger a third-party release) and can
+# also be started manually or via repository_dispatch for an immediate check.
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+  repository_dispatch:
+    types: [xray-release]
+
+concurrency:
+  group: lionray-auto-core
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Check newer Xray core and start release build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          CURRENT=$(jq -r .xray release-config.json)
+          LATEST=$(gh api repos/XTLS/Xray-core/releases/latest --jq .tag_name)
+          LATEST="${LATEST#v}"
+
+          echo "bundled Xray: $CURRENT | latest Xray: $LATEST"
+
+          if ! dpkg --compare-versions "$LATEST" gt "$CURRENT"; then
+            echo "already on the latest core - nothing to do"
+            exit 0
+          fi
+
+          # App version = max(repo version, latest published release) + 1 patch.
+          bump_patch() {
+            local v="$1"
+            local a b c
+            IFS='.' read -r a b c <<< "${v%%[!0-9.]*}"
+            echo "$a.$b.$((c + 1))"
+          }
+
+          REPO_VER=$(jq -r .version src-tauri/tauri.conf.json)
+          LATEST_REL=""
+          LATEST_REL=$(gh api "repos/$REPO/releases/latest" --jq .tag_name 2>/dev/null || true)
+          LATEST_REL="${LATEST_REL#v}"
+          LATEST_REL="${LATEST_REL%%[!0-9.]*}"
+
+          NEXT=$(bump_patch "$REPO_VER")
+          if [ -n "$LATEST_REL" ] && dpkg --compare-versions "$LATEST_REL" gt "$NEXT"; then
+            NEXT=$(bump_patch "$LATEST_REL")
+          fi
+
+          SINGBOX=$(jq -r .singbox release-config.json)
+
+          echo "publishing app v$NEXT with Xray v$LATEST"
+
+          # 1. single source of truth for core versions
+          jq --arg v "$LATEST" '.xray = $v' release-config.json > /tmp/release-config.json
+          mv /tmp/release-config.json release-config.json
+
+          # 2. keep all app version sources aligned
+          jq --arg v "$NEXT" '.version = $v' src-tauri/tauri.conf.json > /tmp/tauri.conf.json
+          mv /tmp/tauri.conf.json src-tauri/tauri.conf.json
+          jq --arg v "$NEXT" '.version = $v' package.json > /tmp/package.json
+          mv /tmp/package.json package.json
+          sed -i "s/^version = \"[^\"]*\"/version = \"$NEXT\"/" src-tauri/Cargo.toml
+          sed -i "s/^version = \"$REPO_VER\"/version = \"$NEXT\"/" src-tauri/Cargo.lock
+          sed -i "s#pub const APP_VERSION: &str = \"[^\"]*\";#pub const APP_VERSION: \\&str = \"$NEXT\";#" src-tauri/src/lib.rs
+
+          # Fail early if any version source was not updated.
+          grep -q "\"version\": \"$NEXT\"" src-tauri/tauri.conf.json
+          grep -q "\"version\": \"$NEXT\"" package.json
+          grep -q "^version = \"$NEXT\"" src-tauri/Cargo.toml
+          grep -q "APP_VERSION: &str = \"$NEXT\"" src-tauri/src/lib.rs
+          grep -q "\"xray\": \"$LATEST\"" release-config.json
+
+          # 3. persist, then 4. start the single combined build/release.
+          git config user.name 'lionray-ci'
+          git config user.email 'lionray-ci@users.noreply.github.com'
+          git add release-config.json package.json src-tauri/tauri.conf.json \
+                  src-tauri/Cargo.toml src-tauri/Cargo.lock src-tauri/src/lib.rs
+          git commit -m "chore: auto-update Xray core to v$LATEST (app v$NEXT)"
+          git push
+
+          gh workflow run build-release.yml \
+            -f app_version="$NEXT" \
+            -f xray_version="v$LATEST" \
+            -f singbox_version="v$SINGBOX"
+
+          echo "started build-release.yml for v$NEXT"

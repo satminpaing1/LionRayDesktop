@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.57";
+pub const APP_VERSION: &str = "1.8.58";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -1579,8 +1579,52 @@ fn generate_config(
 
 // ───────────────────────── xray process + system proxy ─────────────────────────
 
+// The Windows installer is universal: it ships both x64 and ARM64 cores. This
+// app binary itself is x64 (Windows runs it through emulation on ARM64 PCs), so
+// cfg!(target_arch) is NOT enough - ask Windows for the real CPU architecture.
+#[cfg(windows)]
+fn native_arch_is_arm64() -> bool {
+    #[repr(C)]
+    struct SystemInfo {
+        processor_architecture: u16,
+        reserved: u16,
+        rest: [u8; 44],
+    }
+    extern "system" {
+        fn GetNativeSystemInfo(lp_system_info: *mut SystemInfo);
+    }
+    let mut info = SystemInfo {
+        processor_architecture: 0,
+        reserved: 0,
+        rest: [0; 44],
+    };
+    unsafe { GetNativeSystemInfo(&mut info) }
+    info.processor_architecture == 12 // PROCESSOR_ARCHITECTURE_ARM64
+}
+
+#[cfg(not(windows))]
+fn native_arch_is_arm64() -> bool {
+    cfg!(target_arch = "aarch64")
+}
+
+fn active_core_exe() -> &'static str {
+    if cfg!(target_os = "windows") {
+        if native_arch_is_arm64() { "xray-arm64.exe" } else { "xray.exe" }
+    } else {
+        "xray"
+    }
+}
+
 fn find_xray_binary() -> Result<std::path::PathBuf, String> {
-    let exe_name = if cfg!(target_os = "windows") { "xray.exe" } else { "xray" };
+    let exe_names: &[&str] = if cfg!(target_os = "windows") {
+        if native_arch_is_arm64() {
+            &["xray-arm64.exe", "xray.exe"]
+        } else {
+            &["xray.exe", "xray-arm64.exe"]
+        }
+    } else {
+        &["xray"]
+    };
     // Windows builds stage their core in xray-bundle-win; the shared
     // xray-bundle folder keeps the macOS core. Search the native folder first
     // so Windows never tries to launch the Mach-O binary.
@@ -1594,28 +1638,38 @@ fn find_xray_binary() -> Result<std::path::PathBuf, String> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             for b in bundle_names {
-                candidates.push(dir.join(b).join(exe_name));
-                candidates.push(dir.join("resources").join(b).join(exe_name));
-                candidates.push(dir.join("Resources").join(b).join(exe_name));
+                for name in exe_names {
+                    candidates.push(dir.join(b).join(name));
+                    candidates.push(dir.join("resources").join(b).join(name));
+                    candidates.push(dir.join("Resources").join(b).join(name));
+                }
             }
             // macOS .app bundle: exe is in Contents/MacOS, resources in
             // Contents/Resources — go up one level and into Resources.
             if let Some(parent) = dir.parent() {
                 for b in bundle_names {
-                    candidates.push(parent.join("Resources").join(b).join(exe_name));
-                    candidates.push(parent.join("resources").join(b).join(exe_name));
+                    for name in exe_names {
+                        candidates.push(parent.join("Resources").join(b).join(name));
+                        candidates.push(parent.join("resources").join(b).join(name));
+                    }
                 }
             }
-            candidates.push(dir.join(exe_name));
+            for name in exe_names {
+                candidates.push(dir.join(name));
+            }
         }
     }
     if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
         let manifest = std::path::PathBuf::from(manifest);
         for b in bundle_names {
-            candidates.push(manifest.join(b).join(exe_name));
+            for name in exe_names {
+                candidates.push(manifest.join(b).join(name));
+            }
         }
     }
-    candidates.push(std::path::PathBuf::from(exe_name));
+    for name in exe_names {
+        candidates.push(std::path::PathBuf::from(name));
+    }
 
     for c in &candidates {
         if c.exists() {
@@ -1637,35 +1691,47 @@ fn find_xray_binary() -> Result<std::path::PathBuf, String> {
 }
 
 fn find_singbox_binary() -> Result<std::path::PathBuf, String> {
-    let exe_name = if cfg!(target_os = "windows") { "sing-box.exe" } else { "sing-box" };
+    let exe_names: &[&str] = if cfg!(target_os = "windows") {
+        if native_arch_is_arm64() {
+            &["sing-box-arm64.exe", "sing-box.exe"]
+        } else {
+            &["sing-box.exe", "sing-box-arm64.exe"]
+        }
+    } else {
+        &["sing-box"]
+    };
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    let push_all = |dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>| {
+        // Windows builds stage their binaries in xray-bundle-win so the
+        // macOS bundle can keep its own xray binary. Accept both layouts.
+        for bundle in ["xray-bundle-win", "xray-bundle"] {
+            for name in exe_names {
+                out.push(dir.join(bundle).join(name));
+                out.push(dir.join("resources").join(bundle).join(name));
+                out.push(dir.join("Resources").join(bundle).join(name));
+                if let Some(parent) = dir.parent() {
+                    out.push(parent.join("Resources").join(bundle).join(name));
+                    out.push(parent.join("resources").join(bundle).join(name));
+                }
+            }
+        }
+        for name in exe_names {
+            out.push(dir.join(name));
+        }
+    };
 
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            // Windows builds stage their binaries in xray-bundle-win so the
-            // macOS bundle can keep its own xray binary. Accept both layouts.
-            for bundle in ["xray-bundle-win", "xray-bundle"] {
-                candidates.push(dir.join(bundle).join(exe_name));
-            }
-            candidates.push(dir.join("resources").join("xray-bundle-win").join(exe_name));
-            candidates.push(dir.join("resources").join("xray-bundle").join(exe_name));
-            candidates.push(dir.join("Resources").join("xray-bundle-win").join(exe_name));
-            candidates.push(dir.join("Resources").join("xray-bundle").join(exe_name));
-            if let Some(parent) = dir.parent() {
-                candidates.push(parent.join("Resources").join("xray-bundle-win").join(exe_name));
-                candidates.push(parent.join("Resources").join("xray-bundle").join(exe_name));
-                candidates.push(parent.join("resources").join("xray-bundle-win").join(exe_name));
-                candidates.push(parent.join("resources").join("xray-bundle").join(exe_name));
-            }
-            candidates.push(dir.join(exe_name));
+            push_all(dir, &mut candidates);
         }
     }
     if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
         let manifest = std::path::PathBuf::from(manifest);
-        candidates.push(manifest.join("xray-bundle-win").join(exe_name));
-        candidates.push(manifest.join("xray-bundle").join(exe_name));
+        push_all(&manifest, &mut candidates);
     }
-    candidates.push(std::path::PathBuf::from(exe_name));
+    for name in exe_names {
+        candidates.push(std::path::PathBuf::from(name));
+    }
 
     for c in &candidates {
         if c.exists() {
@@ -2843,7 +2909,7 @@ fn rollback_xray_core() -> Result<String, String> {
     let bin_path = find_xray_binary()?;
     let bundle_dir = bin_path.parent().ok_or("xray dir not found")?.to_path_buf();
     let mut restored = false;
-    for name in ["xray.exe", "geoip.dat", "geosite.dat"] {
+    for name in core_bundle_names() {
         let bak = bundle_dir.join(format!("{}.bak", name));
         let dst = bundle_dir.join(name);
         if bak.exists() {
@@ -2852,7 +2918,6 @@ fn rollback_xray_core() -> Result<String, String> {
             restored = true;
         }
     }
-    let _ = std::fs::remove_file(bundle_dir.join("version.txt"));
     if !restored {
         return Err("No backup files found".into());
     }
@@ -3735,8 +3800,9 @@ async fn check_xray_core_update() -> Result<Option<Value>, String> {
         .unwrap_or_default();
     let cur_clean = cur.trim_start_matches('v').trim_start_matches('V').trim().to_string();
 
-    // if same version, no update
-    if remote_ver == cur_clean {
+    // Offer only genuinely newer releases. Equality-only checks would also offer
+    // downgrades when a user is testing a newer core than the latest GitHub tag.
+    if !ver_gt(&remote_ver, &cur_clean) {
         return Ok(None);
     }
 
@@ -3744,7 +3810,9 @@ async fn check_xray_core_update() -> Result<Option<Value>, String> {
     // match can select Xray-windows-arm64-v8a.zip (or the 32-bit build) on
     // an x86_64 PC and install a core that cannot run there.
     let wanted: &[&str] = if cfg!(target_os = "windows") {
-        if cfg!(target_arch = "aarch64") {
+        // Universal installer: the app process may be x64 under emulation, so
+        // use the native CPU rather than cfg!(target_arch).
+        if native_arch_is_arm64() {
             &["Xray-windows-arm64-v8a.zip"]
         } else {
             &["Xray-windows-64.zip"]
@@ -3798,6 +3866,16 @@ async fn check_xray_core_update() -> Result<Option<Value>, String> {
 async fn update_xray_core(url: String) -> Result<String, String> {
     if CONNECTED.load(Ordering::SeqCst) {
         return Err("Disconnect VPN first".into());
+    }
+    if CONNECTING.load(Ordering::SeqCst) || NET_REPAIRING.load(Ordering::SeqCst) {
+        return Err("Wait for the connection to settle before updating the core".into());
+    }
+    // Only official Xray release assets may be flashed. The UI gets this URL
+    // from check_xray_core_update(), but the command must not trust its caller.
+    if !url.starts_with("https://github.com/XTLS/Xray-core/releases/download/")
+        || !url.ends_with(".zip")
+    {
+        return Err("Only official Xray-core release archives are allowed".into());
     }
 
     // 1) download
@@ -3882,11 +3960,9 @@ async fn update_xray_core(url: String) -> Result<String, String> {
     .await
     .map_err(|e| format!("task: {e}"))??;
 
-    let exe_name = if cfg!(target_os = "windows") {
-        "xray.exe"
-    } else {
-        "xray"
-    };
+    // Destination name follows the real CPU, so a universal Windows install
+    // replaces xray-arm64.exe on ARM64 PCs and xray.exe on Intel/AMD ones.
+    let exe_name = active_core_exe();
     let config_path = dirs::config_dir()
         .map(|d| d.join("lionray-vpn").join("config.json"))
         .unwrap_or_default();
@@ -3993,6 +4069,19 @@ async fn update_xray_core(url: String) -> Result<String, String> {
         return Err(msg);
     }
 
+    // Stamp the version from the release URL so get_core_version_sync never has
+    // to spawn the core just to report it (and rollback can restore the stamp).
+    if let Some(tag) = url
+        .split("/releases/download/")
+        .nth(1)
+        .and_then(|s| s.split('/').next())
+    {
+        let stamped = tag.trim_start_matches('v').trim_start_matches('V');
+        if !stamped.is_empty() {
+            let _ = std::fs::write(bundle_dir.join("version.txt"), stamped);
+        }
+    }
+
     let _ = std::fs::remove_dir_all(&tmp);
     let new_ver = tokio::task::spawn_blocking(get_core_version_sync)
         .await
@@ -4002,9 +4091,21 @@ async fn update_xray_core(url: String) -> Result<String, String> {
     Ok(new_ver)
 }
 
-#[cfg(target_os = "windows")]
+// Backup/rollback must work on macOS too: without it a rejected core update
+// leaves the user on a broken binary with no way back. version.txt is included
+// so the reported core version is restored together with the binary.
+fn core_bundle_names() -> Vec<&'static str> {
+    let mut names = if cfg!(target_os = "windows") {
+        vec!["xray.exe", "xray-arm64.exe"]
+    } else {
+        vec!["xray"]
+    };
+    names.extend(["geoip.dat", "geosite.dat", "version.txt"]);
+    names
+}
+
 fn backup_bundle(bundle_dir: &std::path::Path) {
-    for name in ["xray.exe", "geoip.dat", "geosite.dat"] {
+    for name in core_bundle_names() {
         let src = bundle_dir.join(name);
         if src.exists() {
             let _ = std::fs::copy(&src, bundle_dir.join(format!("{}.bak", name)));
@@ -4012,9 +4113,8 @@ fn backup_bundle(bundle_dir: &std::path::Path) {
     }
 }
 
-#[cfg(target_os = "windows")]
 fn restore_bundle_backup(bundle_dir: &std::path::Path) {
-    for name in ["xray.exe", "geoip.dat", "geosite.dat"] {
+    for name in core_bundle_names() {
         let bak = bundle_dir.join(format!("{}.bak", name));
         if bak.exists() {
             let dst = bundle_dir.join(name);
@@ -4023,11 +4123,6 @@ fn restore_bundle_backup(bundle_dir: &std::path::Path) {
         }
     }
 }
-
-#[cfg(not(target_os = "windows"))]
-fn backup_bundle(_d: &std::path::Path) {}
-#[cfg(not(target_os = "windows"))]
-fn restore_bundle_backup(_d: &std::path::Path) {}
 
 // Returns: -2 = broken (socks never came up or server unreachable), -1 = curl unavailable (skip),
 // >=0 = median TLS handshake time in ms.
@@ -4083,6 +4178,9 @@ fn measure_core_latency_sync(exe: &std::path::Path, config_path: &std::path::Pat
     } else {
         "curl"
     };
+    // `NUL` only exists on Windows; on macOS/Linux writing to a file literally
+    // named NUL would leave junk behind and never measure the real request.
+    let null_dev = if cfg!(target_os = "windows") { "NUL" } else { "/dev/null" };
     // quick spawn test
     let mut cv = std::process::Command::new(curl_path);
     cv.arg("--version");
@@ -4103,7 +4201,7 @@ fn measure_core_latency_sync(exe: &std::path::Path, config_path: &std::path::Pat
             "--max-time",
             "8",
             "-o",
-            "NUL",
+            null_dev,
             "-w",
             "%{time_appconnect}",
             "https://www.google.com/generate_204",
