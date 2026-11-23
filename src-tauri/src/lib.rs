@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.54";
+pub const APP_VERSION: &str = "1.8.55";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -207,6 +207,40 @@ fn reassert_system_proxy() {
     if system_proxy_is_ours() {
         return;
     }
+    // Log exactly which view drifted. On Windows the plain registry values and
+    // the per-connection BLOB can disagree; knowing which one changed is what
+    // separates a harmless WPAD re-add from a real proxy theft.
+    #[cfg(target_os = "windows")]
+    {
+        let enable = reg_query_value("ProxyEnable")
+            .map(|v| v.value)
+            .unwrap_or_else(|| "<missing>".into());
+        let server = reg_query_value("ProxyServer")
+            .map(|v| v.value)
+            .unwrap_or_else(|| "<missing>".into());
+        let pac = reg_query_value("AutoConfigURL")
+            .map(|v| v.value)
+            .unwrap_or_else(|| "<missing>".into());
+        let blobs = CONNECTION_BLOBS
+            .iter()
+            .map(|name| {
+                reg_query_binary(name)
+                    .and_then(|raw| ConnectionBlob::parse(&raw))
+                    .map(|b| {
+                        format!(
+                            "{name}:flags=0x{:x},proxy='{}',pac='{}'",
+                            b.flags, b.proxy, b.pac
+                        )
+                    })
+                    .unwrap_or_else(|| format!("{name}:<unreadable>"))
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        app_log(&format!(
+            "system proxy changed externally - restoring (enable={enable} server={server} pac={pac} {blobs})"
+        ));
+    }
+    #[cfg(not(target_os = "windows"))]
     app_log("system proxy was changed externally - restoring the VPN proxy");
     reg_set_value("ProxyServer", "REG_SZ", &format!("127.0.0.1:{HTTP_PORT}"));
     reg_set_value("ProxyEnable", "REG_DWORD", "1");
@@ -2599,6 +2633,9 @@ fn restore_proxy_win() {
                 .unwrap_or(false);
             if ours {
                 reg_set_value("ProxyEnable", "REG_DWORD", "0");
+                // Browsers read the connection BLOB, not just the plain value.
+                // Without this, disconnect leaves them aimed at our dead port.
+                disable_connection_proxy();
             }
             let _ = std::fs::remove_file(&path);
         }
@@ -3380,6 +3417,12 @@ async fn disconnect() -> Result<String, String> {
     // Always run the full cleanup: even when CONNECTED is already false (the
     // core died, or the frontend missed a heartbeat) the user's intent is to
     // stop, so clear AUTO and any half-open TUN/proxy state too.
+    // Clear the intent SYNCHRONOUSLY. The heavy cleanup (kill core, restore
+    // proxy, stop TUN) runs in a blocking pool and can take seconds; leaving
+    // AUTO/CONNECTED set during that window let keep-warm spawn an auto-recover
+    // after the user had already asked to disconnect.
+    AUTO.store(false, Ordering::SeqCst);
+    CONNECTED.store(false, Ordering::SeqCst);
     app_log("disconnect: requested by user");
     tokio::task::spawn_blocking(cleanup)
         .await
