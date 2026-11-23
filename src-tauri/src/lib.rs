@@ -2514,7 +2514,24 @@ fn restore_connection_blobs(backup: &ProxyBackup) {
         ("SavedLegacySettings", backup.saved_legacy_settings.as_deref()),
     ] {
         if let Some(raw) = saved.and_then(|s| engine.decode(s).ok()) {
-            let _ = reg_set_binary(name, &raw);
+            // Same dead-local filter as the plain registry restore: putting a
+            // PAC/proxy that points at a dead local port back would blackhole
+            // every browser again the moment we disconnect.
+            let bytes = if let Some(mut b) = ConnectionBlob::parse(&raw) {
+                if !b.pac.is_empty() && !local_target_alive(&b.pac) {
+                    b.pac.clear();
+                    b.flags &= !WININET_PAC_ON;
+                    app_log("proxy restore: saved PAC points at a dead local port - skipped");
+                }
+                if !b.proxy.is_empty() && !local_target_alive(&b.proxy) {
+                    b.proxy.clear();
+                    b.flags &= !WININET_PROXY_ON;
+                }
+                b.to_bytes()
+            } else {
+                raw
+            };
+            let _ = reg_set_binary(name, &bytes);
         }
         // No saved blob (very old backup): at least take our proxy out of it.
         else if let Some(raw) = reg_query_binary(name) {
