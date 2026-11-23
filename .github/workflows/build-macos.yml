@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       app_version:
-        description: 'App version to build & release (e.g. 1.8.56)'
+        description: 'App version to build & release (e.g. 1.8.57)'
         required: true
         type: string
       xray_version:
