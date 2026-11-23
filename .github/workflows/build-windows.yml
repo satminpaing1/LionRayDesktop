@@ -175,8 +175,16 @@ jobs:
               $dstName = if ($name -eq 'xray.exe') { $pair.Out } else { $name }
               Copy-Item -LiteralPath $src -Destination (Join-Path $bundle $dstName) -Force
             }
-            & (Join-Path $bundle $pair.Out) version
-            if ($LASTEXITCODE -ne 0) { throw "staged $($pair.Out) does not run" }
+            # ARM64 binaries cannot execute on the x64 GitHub runner, but the
+            # archive content was verified above. x64 runs the real smoke test.
+            if ($pair.Out -notlike '*arm64*') {
+              & (Join-Path $bundle $pair.Out) version
+              if ($LASTEXITCODE -ne 0) { throw "staged $($pair.Out) does not run" }
+            } else {
+              $sz = (Get-Item (Join-Path $bundle $pair.Out)).Length
+              if ($sz -lt 5MB) { throw "staged $($pair.Out) is suspiciously small ($sz bytes)" }
+              Write-Host "skipped execution smoke for $($pair.Out) on x64 runner (size=$sz)"
+            }
           }
           Set-Content -LiteralPath (Join-Path $bundle 'version.txt') -Value "${{ steps.ver.outputs.xray }}" -NoNewline
 
@@ -210,8 +218,14 @@ jobs:
             $exe = Get-ChildItem -LiteralPath $dir -Recurse -Filter 'sing-box.exe' | Select-Object -First 1
             if (-not $exe) { throw "sing-box.exe not found in $($pair.Asset)" }
             Copy-Item -LiteralPath $exe.FullName -Destination (Join-Path $bundle $pair.Out) -Force
-            & (Join-Path $bundle $pair.Out) version
-            if ($LASTEXITCODE -ne 0) { throw "staged $($pair.Out) does not run" }
+            if ($pair.Out -notlike '*arm64*') {
+              & (Join-Path $bundle $pair.Out) version
+              if ($LASTEXITCODE -ne 0) { throw "staged $($pair.Out) does not run" }
+            } else {
+              $sz = (Get-Item (Join-Path $bundle $pair.Out)).Length
+              if ($sz -lt 5MB) { throw "staged $($pair.Out) is suspiciously small ($sz bytes)" }
+              Write-Host "skipped execution smoke for $($pair.Out) on x64 runner (size=$sz)"
+            }
           }
           Set-Content -LiteralPath (Join-Path $bundle 'singbox-version.txt') -Value $ver -NoNewline
 
