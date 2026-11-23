@@ -12,7 +12,10 @@ name: Auto-update Xray core
 
 on:
   schedule:
-    - cron: '17 */6 * * *'
+    # GitHub cannot subscribe to a third-party repo's releases, so poll its
+    # latest-release API every 15 min. A build only starts if the core actually
+    # changed, so the extra checks cost almost nothing.
+    - cron: '*/15 * * * *'
   workflow_dispatch:
   repository_dispatch:
     types: [xray-release]

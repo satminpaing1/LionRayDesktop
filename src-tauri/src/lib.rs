@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.59";
+pub const APP_VERSION: &str = "1.8.60";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -4326,17 +4326,94 @@ fn ver_gt(a: &str, b: &str) -> bool {
 }
 
 #[tauri::command]
-async fn check_update() -> Result<Option<String>, String> {
+async fn check_update() -> Result<Option<Value>, String> {
     let body = http_get("https://api.github.com/repos/satminpaing1/LionRayDesktop/releases/latest").await?;
     let v: Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
     let tag = v["tag_name"].as_str().unwrap_or("").to_string();
-    if tag.is_empty() {
-        Ok(None)
-    } else if ver_gt(&tag, APP_VERSION) {
-        Ok(Some(tag))
-    } else {
-        Ok(None)
+    if tag.is_empty() || !ver_gt(&tag, APP_VERSION) {
+        return Ok(None);
     }
+    // Pick the installer for THIS platform. A unified release always contains
+    // one .exe (Windows) and one .dmg (macOS) with the same version.
+    let want_ext = if cfg!(target_os = "windows") { ".exe" } else { ".dmg" };
+    let url = v["assets"]
+        .as_array()
+        .and_then(|a| {
+            a.iter().find(|asset| {
+                asset["name"]
+                    .as_str()
+                    .map(|n| n.ends_with(want_ext))
+                    .unwrap_or(false)
+            })
+        })
+        .and_then(|asset| asset["browser_download_url"].as_str().map(str::to_string))
+        .unwrap_or_default();
+    if url.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(json!({
+        "version": tag,
+        "url": url,
+        "notes": v["body"].as_str().unwrap_or("")
+    })))
+}
+
+// Download a published installer straight into the user's Downloads folder.
+// The URL comes from check_update() (our own repo), but validate again here so
+// a compromised webview cannot make the app fetch an arbitrary remote file.
+#[tauri::command]
+async fn download_app_update(url: String) -> Result<String, String> {
+    const PREFIX: &str = "https://github.com/satminpaing1/LionRayDesktop/releases/download/";
+    if !url.starts_with(PREFIX) || (!url.ends_with(".exe") && !url.ends_with(".dmg")) {
+        return Err("Only official LionRay installers are allowed".into());
+    }
+    let name = url.rsplit('/').next().unwrap_or("");
+    let dest_dir = dirs::download_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))
+        .ok_or("Could not find the Downloads folder")?;
+    std::fs::create_dir_all(&dest_dir).map_err(|e| format!("downloads dir: {e}"))?;
+    let dest = dest_dir.join(name);
+
+    DL_PROGRESS.store(0, Ordering::Relaxed);
+    let dl_url = url.clone();
+    let dl_path = dest.clone();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let client = reqwest::blocking::Client::builder()
+            .user_agent("LionRayVPN-Updater")
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .timeout(std::time::Duration::from_secs(600))
+            .build()
+            .map_err(|e| format!("client: {e}"))?;
+        let mut resp = client.get(&dl_url).send().map_err(|e| format!("download: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("HTTP {}", resp.status()));
+        }
+        let total = resp.content_length().unwrap_or(0);
+        let mut file = std::fs::File::create(&dl_path).map_err(|e| format!("create file: {e}"))?;
+        let mut buf = [0u8; 256 * 1024];
+        let mut done: u64 = 0;
+        loop {
+            let n = resp.read(&mut buf).map_err(|e| format!("read: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            std::io::Write::write_all(&mut file, &buf[..n]).map_err(|e| format!("write: {e}"))?;
+            done += n as u64;
+            let pct = if total > 0 {
+                (done as f64 / total as f64 * 100.0) as u32
+            } else {
+                ((done / (1024 * 1024)) as u32 * 4).min(95)
+            };
+            DL_PROGRESS.store(pct.min(99), Ordering::Relaxed);
+        }
+        DL_PROGRESS.store(100, Ordering::Relaxed);
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|e| format!("task: {e}"))??;
+    DL_PROGRESS.store(0, Ordering::Relaxed);
+    Ok(dest.to_string_lossy().to_string())
 }
 
 // ─── persistent key/value store (file in app data dir) ───
@@ -4476,6 +4553,7 @@ pub fn run() {
             get_core_version,
             app_version,
             check_update,
+            download_app_update,
             check_xray_core_update,
             load_store,
             save_store,

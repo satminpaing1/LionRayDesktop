@@ -417,7 +417,9 @@ function App() {
   const [xrayCheckMsg, setXrayCheckMsg] = useState("");
   const [confirmDlg, setConfirmDlg] = useState<{ msg: string; onOk: () => void } | null>(null);
   const [bypassInput, setBypassInput] = useState("");
-  const [appUpdate, setAppUpdate] = useState<string | null>(null);
+  const [appUpdate, setAppUpdate] = useState<{ version: string; url: string } | null>(null);
+  const [appUpdating, setAppUpdating] = useState(false);
+  const [appProgress, setAppProgress] = useState(0);
   const [logKind, setLogKind] = useState<LogKind>("app");
   const [logs, setLogs] = useState<Record<LogKind, string>>({ app: "", xray: "", singbox: "" });
   const [logBusy, setLogBusy] = useState(false);
@@ -488,15 +490,17 @@ function App() {
     void invoke("set_window_theme", { dark: settings.dark }).catch(() => {});
   }, [settings.dark]);
 
-  // notify the user when a newer desktop release is published. Delayed so the
-  // GitHub request never competes with window paint / auto-connect on launch.
+  // Notify the user when a newer desktop release is published, and keep
+  // checking every 30 min while the app stays open. Delayed on launch so the
+  // GitHub request never competes with window paint / auto-connect.
   useEffect(() => {
-    const t = setTimeout(() => {
-      invoke<string | null>("check_update")
+    const check = () =>
+      invoke<{ version: string; url: string } | null>("check_update")
         .then((v) => { if (v) setAppUpdate(v); })
         .catch(() => {});
-    }, 2500);
-    return () => clearTimeout(t);
+    const first = setTimeout(check, 2500);
+    const poll = setInterval(check, 30 * 60 * 1000);
+    return () => { clearTimeout(first); clearInterval(poll); };
   }, []);
 
   const showToast = useCallback((msg: string, bad = false) => {
@@ -688,7 +692,7 @@ function App() {
   useEffect(() => {
     if (tab === "settings") {
       // always re-check for an available app update (shows the global banner)
-      invoke<string | null>("check_update")
+      invoke<{ version: string; url: string } | null>("check_update")
         .then((t) => { if (t) setAppUpdate(t); })
         .catch(() => {});
     }
@@ -1161,6 +1165,38 @@ function App() {
       .catch((e) => showToast(String(e), true));
   };
 
+  const doAppUpdate = async () => {
+    if (!appUpdate || appUpdating) return;
+    setConfirmDlg({
+      msg: `Download LionRay VPN ${appUpdate.version}?\nThe installer opens when the download finishes.`,
+      onOk: async () => {
+        setConfirmDlg(null);
+        setAppUpdating(true);
+        setAppProgress(0);
+        const poll = setInterval(async () => {
+          try {
+            const p = await invoke<number>("get_download_progress");
+            if (p > 0) setAppProgress(p);
+          } catch {}
+        }, 300);
+        try {
+          const path = await invoke<string>("download_app_update", { url: appUpdate.url });
+          showToast(`Downloaded ✓  Opening installer…`);
+          // open the saved installer / DMG with the OS default handler
+          invoke("open_link", { url: path }).catch(() => {});
+          setAppUpdate(null);
+        } catch (e: any) {
+          const msg = typeof e === "string" ? e : e?.message || "Download failed";
+          showToast(msg.slice(0, 120), true);
+        } finally {
+          clearInterval(poll);
+          setAppUpdating(false);
+          setAppProgress(0);
+        }
+      },
+    });
+  };
+
   const doXrayUpdate = async (url: string) => {
     setConfirmDlg({
       msg: "Download & replace xray core?\nApp will need restart after.",
@@ -1216,17 +1252,12 @@ function App() {
       )}
 
       {appUpdate && (
-        <div
-          className="update-banner"
-          onClick={() =>
-            invoke("open_link", {
-              url: "https://github.com/satminpaing1/LionRayDesktop/releases/latest",
-            })
-          }
-        >
+        <div className="update-banner" onClick={doAppUpdate}>
           <Icon name="download" size={14} />
-          New version {appUpdate} available
-          <Icon name="chevron" size={12} />
+          {appUpdating
+            ? `Downloading ${appUpdate.version}… ${appProgress}%`
+            : `New version ${appUpdate.version} — tap to download`}
+          {!appUpdating && <Icon name="chevron" size={12} />}
         </div>
       )}
 
