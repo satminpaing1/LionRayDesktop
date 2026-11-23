@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.52";
+pub const APP_VERSION: &str = "1.8.53";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -214,6 +214,7 @@ fn reassert_system_proxy() {
     // not exist, exactly like at connect time.
     reg_delete_value("AutoConfigURL");
     reg_set_value("AutoDetect", "REG_DWORD", "0");
+    set_connection_proxy_ours();
     refresh_system_proxy();
 }
 
@@ -699,9 +700,15 @@ fn system_proxy_is_ours() -> bool {
         return false;
     }
     // A PAC script (another VPN client) would override our manual proxy.
-    reg_query_value("AutoConfigURL")
+    if !reg_query_value("AutoConfigURL")
         .map(|v| v.value.trim().is_empty())
         .unwrap_or(true)
+    {
+        return false;
+    }
+    // Browsers read the connection BLOB instead of the plain values above.
+    // If it is stale, re-assert both so "Connected" means apps really route.
+    conn_blob_is_ours()
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -2104,6 +2111,11 @@ struct ProxyBackup {
     proxy_override: Option<RegValue>,
     auto_config_url: Option<RegValue>,
     auto_detect: Option<RegValue>,
+    // base64 of the original WinINET connection BLOBs (browsers read these)
+    #[serde(default)]
+    default_connection_settings: Option<String>,
+    #[serde(default)]
+    saved_legacy_settings: Option<String>,
 }
 
 fn proxy_backup_path() -> Option<std::path::PathBuf> {
@@ -2151,13 +2163,235 @@ fn reg_delete_value(name: &str) {
     let _ = cmd.output();
 }
 
+// ── per-connection proxy settings (the part browsers actually read) ─────
+// Writing only `Internet Settings\ProxyEnable` + `ProxyServer` is NOT enough.
+// Chromium (Edge/Chrome) and several apps read WinINET's connection BLOBs in
+// `...\Internet Settings\Connections`. On this machine that BLOB said "proxy
+// enabled" with an EMPTY server and a dead local PAC (127.0.0.1:10812), so
+// browsers failed with ERR_PROXY_CONNECTION_FAILED while the UI said
+// "Connected" and curl -x through our core worked perfectly. Keep both views
+// in sync and restore the user's original BLOBs on disconnect.
+#[cfg(target_os = "windows")]
+const CONNECTIONS_REG_KEY: &str =
+    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings\Connections";
+#[cfg(target_os = "windows")]
+const WININET_PROXY_ON: u32 = 0x01;
+#[cfg(target_os = "windows")]
+const WININET_AUTODETECT_ON: u32 = 0x02;
+#[cfg(target_os = "windows")]
+const WININET_PAC_ON: u32 = 0x04;
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Debug)]
+struct ConnectionBlob {
+    version: u32,
+    word4: u32,
+    flags: u32,
+    proxy: String,
+    bypass: String,
+    pac: String,
+    tail: Vec<u8>,
+}
+
+#[cfg(target_os = "windows")]
+impl ConnectionBlob {
+    fn parse(raw: &[u8]) -> Option<Self> {
+        if raw.len() < 16 {
+            return None;
+        }
+        let u32at = |off: usize| -> Option<u32> {
+            Some(u32::from_le_bytes(raw.get(off..off + 4)?.try_into().ok()?))
+        };
+        let str_at = |off: usize| -> Option<(String, usize)> {
+            let len = u32at(off)? as usize;
+            let end = off.checked_add(4)?.checked_add(len)?;
+            let s = String::from_utf8_lossy(raw.get(off + 4..end)?).to_string();
+            Some((s, end))
+        };
+        let (proxy, p) = str_at(12)?;
+        let (bypass, b) = str_at(p)?;
+        let (pac, q) = str_at(b)?;
+        Some(Self {
+            version: u32at(0)?,
+            word4: u32at(4)?,
+            flags: u32at(8)?,
+            proxy,
+            bypass,
+            pac,
+            tail: raw.get(q..).unwrap_or(&[]).to_vec(),
+        })
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&self.version.to_le_bytes());
+        out.extend_from_slice(&self.word4.to_le_bytes());
+        out.extend_from_slice(&self.flags.to_le_bytes());
+        for s in [&self.proxy, &self.bypass, &self.pac] {
+            out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            out.extend_from_slice(s.as_bytes());
+        }
+        out.extend_from_slice(&self.tail);
+        out
+    }
+}
+
+#[cfg(target_os = "windows")]
+const CONNECTION_BLOBS: [&str; 2] = ["DefaultConnectionSettings", "SavedLegacySettings"];
+
+#[cfg(target_os = "windows")]
+fn reg_query_binary(name: &str) -> Option<Vec<u8>> {
+    let mut cmd = std::process::Command::new("reg");
+    cmd.args(["query", CONNECTIONS_REG_KEY, "/v", name]);
+    hide_window(&mut cmd);
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let mut it = line.split_whitespace();
+        if !it.next()?.eq_ignore_ascii_case(name) {
+            continue;
+        }
+        it.next()?; // REG_BINARY
+        let hex: String = it.collect();
+        if hex.is_empty() || hex.len() % 2 != 0 {
+            return None;
+        }
+        let bytes = hex.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len() / 2);
+        for pair in bytes.chunks(2) {
+            let hi = (pair[0] as char).to_digit(16)? as u8;
+            let lo = (pair[1] as char).to_digit(16)? as u8;
+            out.push((hi << 4) | lo);
+        }
+        return Some(out);
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn reg_set_binary(name: &str, bytes: &[u8]) -> bool {
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let mut cmd = std::process::Command::new("reg");
+    cmd.args([
+        "add",
+        CONNECTIONS_REG_KEY,
+        "/v",
+        name,
+        "/t",
+        "REG_BINARY",
+        "/d",
+        &hex,
+        "/f",
+    ]);
+    hide_window(&mut cmd);
+    cmd.output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+#[cfg(target_os = "windows")]
+fn conn_blob_is_ours() -> bool {
+    let wanted = format!("127.0.0.1:{HTTP_PORT}");
+    CONNECTION_BLOBS.iter().any(|name| {
+        reg_query_binary(name)
+            .and_then(|raw| ConnectionBlob::parse(&raw))
+            .map(|b| {
+                b.flags & WININET_PROXY_ON != 0
+                    && b.flags & (WININET_PAC_ON | WININET_AUTODETECT_ON) == 0
+                    && b.proxy == wanted
+            })
+            .unwrap_or(false)
+    })
+}
+
+// Windows may have a stale PAC/proxy in the connection BLOB. Rewrite it to the
+// real local HTTP port so browsers stop failing with ERR_PROXY_CONNECTION_FAILED.
+#[cfg(target_os = "windows")]
+fn set_connection_proxy_ours() -> bool {
+    let wanted = format!("127.0.0.1:{HTTP_PORT}");
+    let mut changed = false;
+    for name in CONNECTION_BLOBS {
+        let Some(raw) = reg_query_binary(name) else { continue };
+        let Some(mut b) = ConnectionBlob::parse(&raw) else {
+            continue;
+        };
+        let flags = (b.flags & !(WININET_PAC_ON | WININET_AUTODETECT_ON)) | WININET_PROXY_ON;
+        if b.proxy != wanted || b.flags != flags || !b.pac.is_empty() {
+            b.proxy = wanted.clone();
+            b.flags = flags;
+            b.pac.clear();
+            if reg_set_binary(name, &b.to_bytes()) {
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+// TUN mode owns routing: turn the manual proxy/PAC off in the BLOB as well, or
+// browsers would still aim at a dead local port while the adapter carries all
+// traffic.
+#[cfg(target_os = "windows")]
+fn disable_connection_proxy() {
+    for name in CONNECTION_BLOBS {
+        let Some(raw) = reg_query_binary(name) else { continue };
+        let Some(mut b) = ConnectionBlob::parse(&raw) else {
+            continue;
+        };
+        if b.flags & (WININET_PROXY_ON | WININET_PAC_ON | WININET_AUTODETECT_ON) == 0
+            && b.proxy.is_empty()
+            && b.pac.is_empty()
+        {
+            continue;
+        }
+        b.flags &= !(WININET_PROXY_ON | WININET_PAC_ON | WININET_AUTODETECT_ON);
+        b.proxy.clear();
+        b.pac.clear();
+        let _ = reg_set_binary(name, &b.to_bytes());
+    }
+}
+
 // Remember the user's proxy configuration exactly once per session, before we
 // change anything. Restoring it on disconnect means LionRay never permanently
 // leaves someone else's PAC/proxy settings mangled.
 #[cfg(target_os = "windows")]
+fn current_connection_blobs() -> (Option<String>, Option<String>) {
+    use base64::Engine;
+    let e = base64::engine::general_purpose::STANDARD;
+    (
+        reg_query_binary("DefaultConnectionSettings").map(|b| e.encode(b)),
+        reg_query_binary("SavedLegacySettings").map(|b| e.encode(b)),
+    )
+}
+
+#[cfg(target_os = "windows")]
 fn save_proxy_backup() {
     let Some(path) = proxy_backup_path() else { return };
-    if path.exists() {
+    let mut backup: Option<ProxyBackup> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok());
+    // Older builds saved only the plain values. Fill in the connection BLOBs
+    // before we touch them so disconnect can restore the user's PAC/proxy.
+    if backup.as_ref().map(|b| b.default_connection_settings.is_none()).unwrap_or(false)
+        || backup
+            .as_ref()
+            .map(|b| b.saved_legacy_settings.is_none())
+            .unwrap_or(false)
+    {
+        let (def, legacy) = current_connection_blobs();
+        if let Some(b) = backup.as_mut() {
+            if b.default_connection_settings.is_none() {
+                b.default_connection_settings = def;
+            }
+            if b.saved_legacy_settings.is_none() {
+                b.saved_legacy_settings = legacy;
+            }
+        }
+    }
+    if backup.is_some() {
+        if let Ok(s) = serde_json::to_string_pretty(backup.as_ref().unwrap()) {
+            let _ = std::fs::write(&path, s);
+        }
         return;
     }
     let server = reg_query_value("ProxyServer");
@@ -2165,12 +2399,15 @@ fn save_proxy_backup() {
         .as_ref()
         .map(|v| v.value.contains(&format!("127.0.0.1:{HTTP_PORT}")))
         .unwrap_or(false);
+    let (def, legacy) = current_connection_blobs();
     let backup = ProxyBackup {
         proxy_enable: reg_query_value("ProxyEnable"),
         proxy_server: if ours { None } else { server },
         proxy_override: reg_query_value("ProxyOverride"),
         auto_config_url: reg_query_value("AutoConfigURL"),
         auto_detect: reg_query_value("AutoDetect"),
+        default_connection_settings: def,
+        saved_legacy_settings: legacy,
     };
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -2269,6 +2506,30 @@ fn restore_proxy() {
 }
 
 #[cfg(target_os = "windows")]
+fn restore_connection_blobs(backup: &ProxyBackup) {
+    use base64::Engine;
+    let engine = base64::engine::general_purpose::STANDARD;
+    for (name, saved) in [
+        ("DefaultConnectionSettings", backup.default_connection_settings.as_deref()),
+        ("SavedLegacySettings", backup.saved_legacy_settings.as_deref()),
+    ] {
+        if let Some(raw) = saved.and_then(|s| engine.decode(s).ok()) {
+            let _ = reg_set_binary(name, &raw);
+        }
+        // No saved blob (very old backup): at least take our proxy out of it.
+        else if let Some(raw) = reg_query_binary(name) {
+            if let Some(mut b) = ConnectionBlob::parse(&raw) {
+                if b.proxy.contains(&format!("127.0.0.1:{HTTP_PORT}")) {
+                    b.flags &= !(WININET_PROXY_ON | WININET_AUTODETECT_ON);
+                    b.proxy.clear();
+                    let _ = reg_set_binary(name, &b.to_bytes());
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
 fn restore_proxy_win() {
     let Some(path) = proxy_backup_path() else { return };
     let backup: Option<ProxyBackup> = std::fs::read_to_string(&path)
@@ -2285,6 +2546,8 @@ fn restore_proxy_win() {
             let pac_value = reg_query_value("AutoConfigURL");
             let tun_takeover = !reg_is_on("ProxyEnable") && pac_value.is_none();
             if server_ours || tun_takeover {
+                // Browsers read these, not just the plain registry values.
+                restore_connection_blobs(&b);
                 let saved_proxy_dead = b
                     .proxy_server
                     .as_ref()
@@ -2382,8 +2645,14 @@ fn take_over_proxy_win(on: bool) {
     if on {
         reg_set_value("ProxyServer", "REG_SZ", &format!("127.0.0.1:{HTTP_PORT}"));
         reg_set_value("ProxyEnable", "REG_DWORD", "1");
+        // Edge/Chrome read the connection BLOB; without this they keep aiming
+        // at a stale/dead proxy even though the plain registry says "on".
+        if set_connection_proxy_ours() {
+            app_log("browser proxy settings synced to the tunnel");
+        }
     } else {
         reg_set_value("ProxyEnable", "REG_DWORD", "0");
+        disable_connection_proxy();
     }
     reg_delete_value("AutoConfigURL");
     reg_set_value("AutoDetect", "REG_DWORD", "0");
@@ -2397,14 +2666,32 @@ fn take_over_proxy_win(on: bool) {
 // definitively-dead local case; a remote PAC is left alone.
 #[cfg(target_os = "windows")]
 fn clear_dead_local_pac() {
-    let Some(pac) = reg_query_value("AutoConfigURL") else { return };
-    let value = pac.value.trim();
-    if value.is_empty() || local_target_alive(value) {
-        return;
+    let mut removed = false;
+    if let Some(pac) = reg_query_value("AutoConfigURL") {
+        let value = pac.value.trim();
+        if !value.is_empty() && !local_target_alive(value) {
+            reg_delete_value("AutoConfigURL");
+            removed = true;
+        }
     }
-    app_log("startup: removed dead local PAC (it would blackhole all browsing)");
-    reg_delete_value("AutoConfigURL");
-    refresh_system_proxy();
+    // A dead PAC can also live only in the per-connection BLOB that browsers
+    // read, while the plain AutoConfigURL above is empty.
+    for name in CONNECTION_BLOBS {
+        let Some(raw) = reg_query_binary(name) else { continue };
+        let Some(mut blob) = ConnectionBlob::parse(&raw) else {
+            continue;
+        };
+        if !blob.pac.is_empty() && !local_target_alive(&blob.pac) {
+            blob.pac.clear();
+            blob.flags &= !WININET_PAC_ON;
+            let _ = reg_set_binary(name, &blob.to_bytes());
+            removed = true;
+        }
+    }
+    if removed {
+        app_log("startup: removed dead local PAC (it would blackhole all browsing)");
+        refresh_system_proxy();
+    }
 }
 
 // A crash, an installer upgrade, or a force-killed core can leave the Windows
@@ -4287,5 +4574,45 @@ mod tests {
         let parsed = parse_vless(&uri).unwrap();
         assert_eq!(parsed.fragment, "1,40-60,30-50,tlshello");
         assert_eq!(parsed.ws_path, "/?ed=2560");
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn connection_blob_roundtrip_preserves_bypass_and_detect_stale_pac() {
+        // Shape of a real WinINET connection BLOB: version, word4, flags,
+        // proxy string, bypass string, PAC string.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&70u32.to_le_bytes());
+        raw.extend_from_slice(&9970u32.to_le_bytes());
+        raw.extend_from_slice(&1u32.to_le_bytes()); // proxy enabled
+        raw.extend_from_slice(&0u32.to_le_bytes()); // EMPTY proxy server
+        let bypass = b"<local>;127.*;192.168.*";
+        raw.extend_from_slice(&(bypass.len() as u32).to_le_bytes());
+        raw.extend_from_slice(bypass);
+        let pac = b"http://127.0.0.1:10812/pac?t=123";
+        raw.extend_from_slice(&(pac.len() as u32).to_le_bytes());
+        raw.extend_from_slice(pac);
+
+        let blob = ConnectionBlob::parse(&raw).expect("blob");
+        assert_eq!(blob.proxy, "");
+        assert_eq!(blob.bypass, "<local>;127.*;192.168.*");
+        assert!(blob.pac.contains("10812"));
+        assert_eq!(blob.to_bytes(), raw, "parse/build must be lossless");
+        assert_eq!(blob.flags & WININET_PROXY_ON, WININET_PROXY_ON);
+
+        // The broken shape must NOT be accepted as ours: browsers would fail.
+        assert!(!blob.pac.is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn connection_blob_flags_logic_marks_ours_correctly() {
+        let wanted = format!("127.0.0.1:{HTTP_PORT}");
+        let flags = (WININET_PAC_ON | WININET_AUTODETECT_ON | 0x08)
+            & !(WININET_PAC_ON | WININET_AUTODETECT_ON)
+            | WININET_PROXY_ON;
+        assert_eq!(flags & WININET_PROXY_ON, WININET_PROXY_ON);
+        assert_eq!(flags & (WININET_PAC_ON | WININET_AUTODETECT_ON), 0);
+        assert_eq!(wanted, "127.0.0.1:10809");
     }
 }
