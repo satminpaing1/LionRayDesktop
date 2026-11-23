@@ -1888,6 +1888,13 @@ fn tun_captures_all() -> bool {
     }
 }
 
+// TUN route verification is Windows-only (sing-box manages the adapter).
+// macOS/Linux use the system proxy, so there is no route table to inspect.
+#[cfg(not(target_os = "windows"))]
+fn tun_captures_all() -> bool {
+    true
+}
+
 fn tun_alive() -> bool {
     match TUN_CHILD.lock() {
         Ok(mut g) => match g.as_mut() {
@@ -2022,6 +2029,7 @@ fn tunnel_route_file() -> std::path::PathBuf {
         .join("tun-route.txt")
 }
 
+#[cfg(target_os = "windows")]
 fn clear_tunnel_host_route() {
     let Ok(content) = std::fs::read_to_string(tunnel_route_file()) else {
         return;
