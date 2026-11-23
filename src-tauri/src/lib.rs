@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.58";
+pub const APP_VERSION: &str = "1.8.59";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -168,14 +168,14 @@ fn set_keep_awake(_on: bool) {}
 // ignored: a slow or flaky probe target must never trigger a teardown. This
 // only exists to keep the WebSocket warm, exactly like a well-known VPN's
 // idle keep-alive.
-fn warm_tunnel() {
+fn warm_tunnel() -> bool {
     let tun_on = TUN_CHILD.lock().map(|g| g.is_some()).unwrap_or(false);
     if tun_on {
         // TUN mode owns the default route, so a plain request enters it.
-        let _ = probe_urls_race_direct(&PROBE_URLS, 3);
+        probe_urls_race_direct(&PROBE_URLS, 3)
     } else {
         // Proxy mode: Xray's SOCKS port is the real data path.
-        let _ = probe_urls_race_socks(&PROBE_URLS, 3);
+        probe_urls_race_socks(&PROBE_URLS, 3)
     }
 }
 
@@ -388,27 +388,31 @@ fn start_tunnel_keepalive() {
                     reassert_system_proxy();
                 }
             }
-            // Full data-path verification once a minute (every 4th tick);
-            // light warm traffic on the other ticks.
-            if tick % 4 == 0 {
+            // Verify the data path on EVERY tick. A 7 s full probe once a
+            // minute meant 3 straight failures took ~3 min to trigger recovery
+            // - far too long to sit with a dead line. The light 3 s warm probe
+            // on other ticks now feeds the same guarded streak, so 3 straight
+            // failures take ~45 s. A single success still resets the streak,
+            // so a flaky probe can never churn a healthy connection.
+            let ok = if tick % 4 == 0 {
                 let tun_on = tunnel_mode_is_tun();
-                let ok = if tun_on {
+                if tun_on {
                     probe_urls_race_direct(PROBE_URLS, 7)
                 } else {
                     probe_urls_race_socks(PROBE_URLS, 7)
-                };
-                if ok {
-                    DEAD_PROBE_STREAK.store(0, Ordering::SeqCst);
-                } else {
-                    let s = DEAD_PROBE_STREAK.fetch_add(1, Ordering::SeqCst) + 1;
-                    app_log(&format!("keep-warm: data path unreachable ({s}/3)"));
-                    if s >= 3 {
-                        DEAD_PROBE_STREAK.store(0, Ordering::SeqCst);
-                        spawn_auto_recover();
-                    }
                 }
             } else {
-                warm_tunnel();
+                warm_tunnel()
+            };
+            if ok {
+                DEAD_PROBE_STREAK.store(0, Ordering::SeqCst);
+            } else {
+                let s = DEAD_PROBE_STREAK.fetch_add(1, Ordering::SeqCst) + 1;
+                app_log(&format!("keep-warm: data path unreachable ({s}/3)"));
+                if s >= 3 {
+                    DEAD_PROBE_STREAK.store(0, Ordering::SeqCst);
+                    spawn_auto_recover();
+                }
             }
         }
     });
@@ -1215,11 +1219,10 @@ fn build_stream(server: &Server) -> Value {
                 "heartbeatPeriod": 20
             });
             if !server.ws_host.is_empty() {
-                // 26.11.x moved the WS Host to a dedicated field and warns that
-                // headers.Host is deprecated. Emit both: older cores use the
-                // header, newer ones use `host`, so either version can dial a
-                // Cloudflare-fronted server without an EOF on the upgrade.
-                ws["headers"] = json!({ "Host": server.ws_host });
+                // 26.11.x uses the dedicated `host` field. headers.Host is
+                // deprecated there and spams xray.log with a warning on every
+                // start - the independent field is supported by every core we
+                // ship (including the rollback core), so emit only that.
                 ws["host"] = json!(server.ws_host);
             }
             stream["wsSettings"] = ws;
@@ -1410,6 +1413,18 @@ fn generate_config(
         }));
     }
 
+    // Local security software (Avira, etc.) floods the proxy with reputation
+    // checks - on one machine this was 85% of ALL tunnel traffic, saturating
+    // the single WebSocket and causing EOF drops + a slow line. These checks
+    // carry no user browsing traffic, so always send them direct. This is
+    // independent of the user's own bypass list and cannot be disabled by a
+    // stale saved setting.
+    rules.push(json!({
+        "type": "field",
+        "domain": ["domain:avira.com"],
+        "outboundTag": "direct"
+    }));
+
     match routing {
         "global" => {}
         "cn" => {
@@ -1524,8 +1539,11 @@ fn generate_config(
         outbounds.push(json!({
             "tag": "direct",
             "protocol": "freedom",
-            "settings": { "domainStrategy": "UseIPv4" },
+            "settings": {},
             "streamSettings": { "sockopt": {
+                // Only the current sockopt location: the legacy
+                // settings.domainStrategy is deprecated in 26.11.x and logs a
+                // migration warning on every start.
                 "domainStrategy": "UseIPv4",
                 "tcpKeepAliveIdle": 30,
                 "tcpKeepAliveInterval": 10,
@@ -4586,7 +4604,7 @@ mod tests {
             "smp.settminpaing.mm.am"
         );
         assert_eq!(
-            outbounds[0]["streamSettings"]["wsSettings"]["headers"]["Host"],
+            outbounds[0]["streamSettings"]["wsSettings"]["host"],
             "smp.settminpaing.mm.am"
         );
         assert_eq!(
@@ -4607,10 +4625,26 @@ mod tests {
         // after idle" without restarting anything.
         assert_eq!(ws["heartbeatPeriod"], 20);
         assert_eq!(ws["path"], "/?ed=2560");
-        // Both old (headers.Host) and new (host) WS fields are emitted so the
-        // config works on 26.3.x and 26.11.x alike.
-        assert_eq!(ws["headers"]["Host"], "smp.settminpaing.mm.am");
+        // Only the independent `host` field is emitted: headers.Host is
+        // deprecated in 26.11.x and spams the log with a warning on start.
         assert_eq!(ws["host"], "smp.settminpaing.mm.am");
+    }
+
+    #[test]
+    fn avira_reputation_checks_bypass_the_tunnel() {
+        // Avira's web-rep scanner generated 85% of all tunnel traffic on one
+        // machine, saturating the single WebSocket and causing EOF drops.
+        // It must always route direct, even with an empty user bypass list.
+        let cfg: Value = serde_json::from_str(
+            &generate_config(&user_server(), "global", "system", false, &[], false, false, false)
+                .unwrap(),
+        )
+        .unwrap();
+        let rules = cfg["routing"]["rules"].as_array().unwrap();
+        assert!(rules.iter().any(|r| {
+            r["outboundTag"] == "direct"
+                && r["domain"][0] == "domain:avira.com"
+        }));
     }
 
     #[test]
@@ -4644,7 +4678,7 @@ mod tests {
             "smp.settminpaing.mm.am"
         );
         assert_eq!(
-            cfg["outbounds"][0]["streamSettings"]["wsSettings"]["headers"]["Host"],
+            cfg["outbounds"][0]["streamSettings"]["wsSettings"]["host"],
             "smp.settminpaing.mm.am"
         );
     }
@@ -4680,7 +4714,10 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .any(|o| o["tag"] == "direct" && o["settings"]["domainStrategy"] == "UseIPv4"));
+            .any(|o| {
+                o["tag"] == "direct"
+                    && o["streamSettings"]["sockopt"]["domainStrategy"] == "UseIPv4"
+            }));
 
         let explicit = generate_config(
             &user_server(), "global", "cloudflare", true, &[], true, true, false,
