@@ -2199,7 +2199,19 @@ function App() {
             </div>
             <div className="modal-actions">
               <button className="btn-secondary" onClick={() => setConfirmDlg(null)}>Cancel</button>
-              <button className="btn-primary m0" onClick={confirmDlg.onOk}>OK</button>
+              <button
+                className="btn-primary m0"
+                onClick={() => {
+                  // Always dismiss first: every OK action (including node
+                  // deletion) must leave the dialog closed, even if the action
+                  // itself forgets to clear it or throws.
+                  const onOk = confirmDlg.onOk;
+                  setConfirmDlg(null);
+                  onOk();
+                }}
+              >
+                OK
+              </button>
             </div>
           </div>
         </div>
