@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.53";
+pub const APP_VERSION: &str = "1.8.54";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -2296,8 +2296,11 @@ fn conn_blob_is_ours() -> bool {
         reg_query_binary(name)
             .and_then(|raw| ConnectionBlob::parse(&raw))
             .map(|b| {
+                // Windows re-adds the AUTODETECT bit when the proxy cache is
+                // refreshed; fighting it only makes keep-warm rewrite the
+                // settings every tick (and log a false "changed externally").
                 b.flags & WININET_PROXY_ON != 0
-                    && b.flags & (WININET_PAC_ON | WININET_AUTODETECT_ON) == 0
+                    && b.flags & WININET_PAC_ON == 0
                     && b.proxy == wanted
             })
             .unwrap_or(false)
