@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
-pub const APP_VERSION: &str = "1.8.55";
+pub const APP_VERSION: &str = "1.8.56";
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
 const API_PORT: u16 = 15490;
@@ -2274,22 +2274,22 @@ impl ConnectionBlob {
 const CONNECTION_BLOBS: [&str; 2] = ["DefaultConnectionSettings", "SavedLegacySettings"];
 
 #[cfg(target_os = "windows")]
-fn reg_query_binary(name: &str) -> Option<Vec<u8>> {
-    let mut cmd = std::process::Command::new("reg");
-    cmd.args(["query", CONNECTIONS_REG_KEY, "/v", name]);
-    hide_window(&mut cmd);
-    let out = cmd.output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
+fn parse_reg_binary_output(output: &str, name: &str) -> Option<Vec<u8>> {
+    for line in output.lines() {
         let mut it = line.split_whitespace();
-        if !it.next()?.eq_ignore_ascii_case(name) {
+        // reg.exe wraps its output in BLANK lines. A bare `it.next()?` here
+        // aborts the whole lookup on the first blank line, so every BLOB read
+        // failed and keep-warm thought the proxy had been stolen each tick.
+        let Some(found) = it.next() else { continue };
+        if !found.eq_ignore_ascii_case(name) {
             continue;
         }
-        it.next()?; // REG_BINARY
+        let Some(_kind) = it.next() else { continue }; // REG_BINARY
         let hex: String = it.collect();
-        if hex.is_empty() || hex.len() % 2 != 0 {
+        if hex.is_empty()
+            || hex.len() % 2 != 0
+            || !hex.bytes().all(|b| b.is_ascii_hexdigit())
+        {
             return None;
         }
         let bytes = hex.as_bytes();
@@ -2302,6 +2302,18 @@ fn reg_query_binary(name: &str) -> Option<Vec<u8>> {
         return Some(out);
     }
     None
+}
+
+#[cfg(target_os = "windows")]
+fn reg_query_binary(name: &str) -> Option<Vec<u8>> {
+    let mut cmd = std::process::Command::new("reg");
+    cmd.args(["query", CONNECTIONS_REG_KEY, "/v", name]);
+    hide_window(&mut cmd);
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_reg_binary_output(&String::from_utf8_lossy(&out.stdout), name)
 }
 
 #[cfg(target_os = "windows")]
@@ -4677,5 +4689,21 @@ mod tests {
         assert_eq!(flags & WININET_PROXY_ON, WININET_PROXY_ON);
         assert_eq!(flags & (WININET_PAC_ON | WININET_AUTODETECT_ON), 0);
         assert_eq!(wanted, "127.0.0.1:10809");
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn reg_binary_parser_skips_reg_exe_blank_lines() {
+        // Exact shape of `reg query ... /v DefaultConnectionSettings`: a blank
+        // line first, the key path, the value, then a trailing blank line.
+        let output = "\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\\Connections\n    DefaultConnectionSettings    REG_BINARY    46000000FD26000001000000\n\n";
+        let parsed = parse_reg_binary_output(output, "DefaultConnectionSettings")
+            .expect("must parse despite leading blank line");
+        assert_eq!(
+            parsed,
+            vec![0x46, 0x00, 0x00, 0x00, 0xFD, 0x26, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00]
+        );
+        assert!(parse_reg_binary_output(output, "SavedLegacySettings").is_none());
+        assert!(parse_reg_binary_output("\n\n", "DefaultConnectionSettings").is_none());
     }
 }
