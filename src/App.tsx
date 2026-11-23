@@ -104,7 +104,7 @@ type IconName =
   | "power" | "download" | "upload" | "server" | "chevron" | "arrow-left"
   | "plus" | "refresh" | "copy" | "trash" | "search" | "close"
   | "camera" | "image" | "clipboard" | "link" | "edit" | "share"
-  | "more" | "timer" | "check" | "lock";
+  | "more" | "timer" | "check" | "lock" | "history";
 
 // One consistent line-icon set instead of multicolour emoji, so the whole
 // window reads as one calm surface.
@@ -194,6 +194,9 @@ function Icon({ name, size = 20, strokeWidth = 1.8 }: { name: IconName; size?: n
       break;
     case "lock":
       body = <><rect x="4.5" y="10" width="15" height="10.5" rx="2.5" /><path d="M8 10V7.5a4 4 0 0 1 8 0V10" /></>;
+      break;
+    case "history":
+      body = <><path d="M3.5 11a8.5 8.5 0 1 1 2.4 6.4" /><path d="M3.5 5v6h6" /><path d="M12 7.5V12l3 2" /></>;
       break;
   }
   return (
@@ -1752,7 +1755,7 @@ function App() {
                     <button className="btn-primary m0" onClick={() => doXrayUpdate(xrayUpdate.url)}>
                       Update Now
                     </button>
-                    <button className="btn-secondary" onClick={checkXrayUpdate} aria-label="Refresh"><Icon name="refresh" size={14} /></button>
+                    <button className="btn-secondary icon-only" onClick={checkXrayUpdate} aria-label="Refresh"><Icon name="refresh" size={14} /></button>
                   </div>
                 </>
               ) : (
@@ -1768,6 +1771,7 @@ function App() {
                     </button>
                     <button
                       className="btn-secondary"
+                      title="Restore the previously saved core version"
                       onClick={async () => {
                         try {
                           const v = await invoke<string>("rollback_xray_core");
@@ -1778,7 +1782,7 @@ function App() {
                         }
                       }}
                     >
-                      <Icon name="refresh" size={13} /> Restore backup
+                      <Icon name="history" size={13} /> Restore backup
                     </button>
                   </div>
                 </>

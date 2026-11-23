@@ -946,10 +946,35 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .about-box { margin: 20px 0 2px; color: var(--sub); font-size: 10.5px; line-height: 1.6; text-align: center; }
 
 /* ── update card ── */
-.update-card { padding: 12px 14px !important; }
-.update-btn-row { display: flex; gap: 7px; margin-top: 10px; }
-.update-btn-row .btn-primary { flex: 1; }
-.update-btn-row .btn-secondary { width: 38px; flex-shrink: 0; padding: 8px 0; display: grid; place-items: center; }
+/* Keep the same height in all three states (checking / available / updating)
+   so the settings list never jumps while a request is in flight. */
+.update-card {
+  padding: 12px 14px !important;
+  min-height: 104px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+.update-btn-row { display: flex; gap: 8px; margin-top: 10px; }
+.update-btn-row .btn-primary { flex: 1; width: auto; }
+/* Both action buttons share the row evenly and keep readable labels. */
+.update-btn-row .btn-secondary {
+  flex: 1;
+  min-width: 0;
+  width: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 10px 8px;
+  white-space: nowrap;
+}
+/* Only the refresh icon next to "Update Now" is compressed to a square. */
+.update-btn-row .btn-secondary.icon-only {
+  flex: 0 0 38px;
+  width: 38px;
+  padding: 10px 0;
+}
 .update-progress-wrap { padding: 2px 0; }
 .update-progress-bar { width: 100%; height: 4px; border-radius: 99px; background: var(--line); overflow: hidden; }
 .update-progress-fill { height: 100%; border-radius: 99px; background: var(--primary); transition: width .25s ease; }
