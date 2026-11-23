@@ -1,16 +1,23 @@
-name: Build macOS (universal dmg / pkg)
+name: Build macOS (universal dmg)
+
+# One-shot universal macOS build (Apple Silicon + Intel in a single .dmg):
+#   * manual run  -> needs app_version, optional Xray pin
+#   * tag push    -> app version comes from the tag (v1.6.0)
+# The release uses a separate `-macos` tag so it never overwrites the Windows
+# release notes or its installer asset.
 
 on:
   workflow_dispatch:
     inputs:
       app_version:
-        description: 'App version to build & release (e.g. 1.7.0)'
+        description: 'App version to build & release (e.g. 1.8.56)'
         required: true
         type: string
       xray_version:
-        description: 'Optional: pin Xray core tag (e.g. v26.3.27). Leave empty = latest'
+        description: 'Optional: pin Xray core tag (default v26.3.27 - validated)'
         required: false
         type: string
+        default: 'v26.3.27'
   push:
     tags:
       - "v*"
@@ -35,9 +42,7 @@ jobs:
       - name: Install frontend deps
         run: npm install
 
-      # Set the app version across all the places that define it, so the dmg
-      # name, the About panel and the in-app update check all agree. Uses
-      # single-quoted sed expressions so the embedded " chars stay literal.
+      # Keep every version source in sync: dmg filename, About panel, updater.
       - name: Set app version
         run: |
           APP_VER="${{ github.event.inputs.app_version || '1.6.0' }}"
@@ -48,22 +53,18 @@ jobs:
           grep -n '"version"' src-tauri/tauri.conf.json package.json
           grep -n 'APP_VERSION: &str' src-tauri/src/lib.rs
 
-      # XTLS only ships single-arch macOS binaries (macos-64 = x86_64,
-      # macos-arm64-v8a = arm64). To make a TRULY universal .app we merge both
-      # into one fat xray binary with lipo, then bundle that.
+      # XTLS only ships single-arch macOS binaries. Merge both with lipo so the
+      # .app truly runs on Intel and Apple Silicon without Rosetta.
       - name: Build universal Xray core (lipo x86_64 + arm64)
         id: xray
         run: |
           set -e
-          # Default: bundle the LATEST real Xray core automatically.
-          # Pin with the xray_version workflow input to freeze a specific core.
-          if [ -z "${{ github.event.inputs.xray_version }}" ]; then
+          TAG="${{ github.event.inputs.xray_version }}"
+          if [ -z "$TAG" ] || [ "$TAG" = "latest" ]; then
             TAG=$(curl -fsSL --retry 5 --retry-delay 5 -o /dev/null -w '%{url_effective}' \
                   "https://github.com/XTLS/Xray-core/releases/latest" \
                   | sed -E 's#.*/tag/([^/]+).*#\1#')
             [ -z "$TAG" ] && TAG="v26.3.27"
-          else
-            TAG="${{ github.event.inputs.xray_version }}"
           fi
           echo "Xray core tag: $TAG"
           mkdir -p /tmp/xray/{x86,arm}
@@ -83,27 +84,36 @@ jobs:
         env:
           CI: true
 
-      - name: Upload dmg / pkg artifacts
+      - name: Verify DMG was produced
+        run: |
+          set -e
+          DMG=$(find src-tauri/target/universal-apple-darwin/release/bundle/dmg -name '*.dmg' -print -quit)
+          [ -n "$DMG" ] || { echo "no dmg produced"; exit 1; }
+          echo "dmg=$DMG"
+          ls -lh "$DMG"
+
+      - name: Upload dmg artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: lionray-macos
-          path: |
-            src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
-            src-tauri/target/universal-apple-darwin/release/bundle/pkg/*.pkg
-          if-no-files-found: warn
+          name: lionray-macos-universal
+          path: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: error
 
-      - name: Create / update GitHub Release
+      - name: Create / update macOS GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ github.event.inputs.app_version || '1.6.0' }}
+          tag_name: v${{ github.event.inputs.app_version || '1.6.0' }}-macos
           name: "LionRay VPN Desktop v${{ github.event.inputs.app_version || '1.6.0' }} (Universal macOS)"
           body: |
-            Universal macOS build (Apple Silicon + Intel).
-            Xray core: ${{ steps.xray.outputs.xray_ver }}
+            Universal macOS build for **Apple Silicon + Intel** in one .dmg.
 
-            > Unsigned build — right-click the app and choose Open to bypass
-            > Gatekeeper, or run: xattr -dr com.apple.quarantine "/Applications/LionRay VPN.app"
-          files: |
-            src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
-            src-tauri/target/universal-apple-darwin/release/bundle/pkg/*.pkg
+            - Xray core: ${{ steps.xray.outputs.xray_ver }} (universal binary via lipo)
+            - Same UI as Windows v${{ github.event.inputs.app_version || '1.6.0' }}
+            - System proxy is enabled only while connected and turned off on disconnect.
+
+            > Unsigned build — right-click the app and choose **Open** to bypass
+            > Gatekeeper, or run:
+            > `xattr -dr com.apple.quarantine "/Applications/LionRay VPN.app"`
+          files: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          fail_on_unmatched_files: true
           overwrite_files: true

@@ -2673,32 +2673,46 @@ fn take_over_proxy(on: bool) {
     }
     #[cfg(target_os = "macos")]
     {
-        let action = if on { "on_args" } else { "off" };
-        let _ = action;
-        if let Ok(out) = std::process::Command::new("networksetup").arg("-listallnetworkservices").output() {
+        // `-setwebproxy` only stores the address; the proxy stays DISABLED
+        // until `-setwebproxystate ... on` is issued. Without those state
+        // commands the UI says Connected while Safari/Chrome use the direct
+        // network - the exact "connected but no apps work" complaint.
+        let http_port = HTTP_PORT.to_string();
+        let socks_port = SOCKS_PORT.to_string();
+        if let Ok(out) = std::process::Command::new("networksetup")
+            .arg("-listallnetworkservices")
+            .output()
+        {
             let list = String::from_utf8_lossy(&out.stdout);
+            let mut changed = false;
             for line in list.lines().skip(1) {
                 let svc = line.trim();
                 if svc.is_empty() || svc.contains('*') {
                     continue;
                 }
+                let run = |args: &[&str]| {
+                    let _ = std::process::Command::new("networksetup").args(args).output();
+                };
                 if on {
-                    let _ = std::process::Command::new("networksetup")
-                        .args(["-setwebproxy", svc, "127.0.0.1", &HTTP_PORT.to_string()])
-                        .output();
-                    let _ = std::process::Command::new("networksetup")
-                        .args(["-setsecurewebproxy", svc, "127.0.0.1", &HTTP_PORT.to_string()])
-                        .output();
-                    let _ = std::process::Command::new("networksetup")
-                        .args(["-setsocksfirewallproxy", svc, "127.0.0.1", &SOCKS_PORT.to_string()])
-                        .output();
+                    run(&["-setwebproxy", svc, "127.0.0.1", &http_port]);
+                    run(&["-setwebproxystate", svc, "on"]);
+                    run(&["-setsecurewebproxy", svc, "127.0.0.1", &http_port]);
+                    run(&["-setsecurewebproxystate", svc, "on"]);
+                    run(&["-setsocksfirewallproxy", svc, "127.0.0.1", &socks_port]);
+                    run(&["-setsocksfirewallproxystate", svc, "on"]);
                 } else {
-                    let _ = std::process::Command::new("networksetup").args(["-setwebproxystate", svc, "off"]).output();
-                    let _ = std::process::Command::new("networksetup").args(["-setsecurewebproxystate", svc, "off"]).output();
-                    let _ = std::process::Command::new("networksetup")
-                        .args(["-setsocksfirewallproxystate", svc, "off"])
-                        .output();
+                    run(&["-setwebproxystate", svc, "off"]);
+                    run(&["-setsecurewebproxystate", svc, "off"]);
+                    run(&["-setsocksfirewallproxystate", svc, "off"]);
                 }
+                changed = true;
+            }
+            if changed {
+                app_log(if on {
+                    "macOS network proxies enabled for the tunnel"
+                } else {
+                    "macOS network proxies disabled"
+                });
             }
         }
     }
